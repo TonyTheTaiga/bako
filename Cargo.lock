@@ -102,6 +102,7 @@ name = "bako"
 version = "0.1.0"
 dependencies = [
  "env_logger",
+ "infer",
  "notify",
  "serde",
  "tokio",
@@ -209,6 +210,12 @@ dependencies = [
  "equivalent",
  "hashbrown",
 ]
+
+[[package]]
+name = "infer"
+version = "0.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "865e8a58ae8e24d2c4412c31344afa1d302a3740ad67528c10f50d6876cdcf55"
 
 [[package]]
 name = "inotify"
