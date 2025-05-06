@@ -8,6 +8,12 @@ use tokio::sync::mpsc;
 mod db;
 use db::Database;
 
+#[derive(Debug)]
+struct FileEvent {
+    kind: String,
+    file: db::File,
+}
+
 fn get_file_type(path_str: &str) -> std::result::Result<&'static str, Box<dyn std::error::Error>> {
     match infer::get_from_path(path_str) {
         Ok(Some(kind)) => Ok(kind.mime_type()),
@@ -48,7 +54,7 @@ async fn handle_event(
                             let file = db.create_file(path_str, file_type, &hash)?;
                             return Ok(FileEvent {
                                 kind: "NewFile".into(),
-                                file: file.into(),
+                                file,
                             });
                         } else {
                             return Err("Invalid UTF-8 path".into());
@@ -72,7 +78,7 @@ async fn handle_event(
                     let file = db.delete_file(path_str)?;
                     return Ok(FileEvent {
                         kind: "Delete".into(),
-                        file: file.into(),
+                        file,
                     });
                 }
             }
@@ -96,12 +102,6 @@ async fn handle_event(
     }
 }
 
-#[derive(Debug)]
-struct FileEvent {
-    kind: String,
-    file: db::File,
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize database
@@ -119,13 +119,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok(mut watcher) = watcher_init {
             watcher
                 .watch(
-                    Path::new("/Users/taiga/Code/data"),
+                    Path::new("/Users/taigaishida/workspace/bako/data"),
                     RecursiveMode::Recursive,
                 )
                 .unwrap();
             std::thread::park();
         } else {
-            eprintln!("Failed to initialize watcher");
+            println!("Failed to initialize watcher");
         }
     });
 
@@ -144,7 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(fe) => {
                     eh_tx.send(fe).await?;
                 }
-                Err(e) => eprintln!("Error handling event: {:?}", e),
+                Err(e) => println!("Error handling event: {:?}", e),
             },
             Err(error) => println!("Failed to initialize watcher! {:?}", error),
         }
