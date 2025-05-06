@@ -1,4 +1,5 @@
 use blake3::Hasher;
+use directories::BaseDirs;
 use notify::{RecursiveMode, Watcher, recommended_watcher};
 use std::path::Path;
 use tokio::fs;
@@ -14,12 +15,11 @@ struct FileEvent {
     file: db::File,
 }
 
-fn get_file_type(path_str: &str) -> std::result::Result<&'static str, Box<dyn std::error::Error>> {
-    match infer::get_from_path(path_str) {
-        Ok(Some(kind)) => Ok(kind.mime_type()),
-        Ok(None) => Ok("text/plain"),
-        Err(_) => Err("failed to get file type".into()),
-    }
+fn get_file_type(path_str: &str) -> io::Result<String> {
+    let kind = infer::get_from_path(path_str)?;
+    Ok(kind
+        .map(|k| k.mime_type().to_string())
+        .unwrap_or_else(|| "text/plain".into()))
 }
 
 async fn hash_file(path: &str) -> io::Result<String> {
@@ -37,6 +37,7 @@ async fn hash_file(path: &str) -> io::Result<String> {
 
     Ok(hasher.finalize().to_hex().to_string())
 }
+
 async fn handle_event(
     event: notify::Event,
     db: &Database,
@@ -51,7 +52,7 @@ async fn handle_event(
                         if let Some(path_str) = path.to_str() {
                             let file_type = get_file_type(path_str)?;
                             let hash = hash_file(path_str).await?;
-                            let file = db.create_file(path_str, file_type, &hash)?;
+                            let file = db.create_file(path_str, &file_type, &hash)?;
                             return Ok(FileEvent {
                                 kind: "NewFile".into(),
                                 file,
@@ -102,8 +103,16 @@ async fn handle_event(
     }
 }
 
+fn init_config_dir() -> std::result::Result<()> {
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(base_dirs) = BaseDirs::new() {
+        println!("{:?}", base_dirs.config_local_dir());
+    }
+
     // Initialize database
     let db_path = Path::new("bako.db");
     let db = Database::new(db_path)?;
