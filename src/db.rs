@@ -1,7 +1,9 @@
 use std::path::Path;
 
 use rusqlite::Connection;
+use uuid::Uuid;
 
+#[derive(Debug)]
 pub struct File {
     id: String,
     path: String,
@@ -50,7 +52,32 @@ impl Database {
         file_type: &str,
         hash: &str,
     ) -> std::result::Result<File, rusqlite::Error> {
-        let _ = self.conn.execute("", [])?;
+        let id = Uuid::new_v4();
+        use rusqlite::Row;
+
+        let file = self.conn.query_row(
+            r#"
+            INSERT INTO files (id, path, file_type, hash)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(path) DO UPDATE SET
+                file_type = excluded.file_type,
+                hash = excluded.hash,
+                updated_at = CURRENT_TIMESTAMP
+            RETURNING id, path, file_type, hash, created_at, updated_at;
+            "#,
+            [&id.to_string(), path_str, file_type, hash],
+            |row: &Row| {
+                Ok(File {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                    file_type: row.get(2)?,
+                    hash: row.get(3)?,
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
+                })
+            },
+        )?;
+        Ok(file)
     }
 
     pub fn delete_file(&self, path: &str) -> std::result::Result<File, rusqlite::Error> {
