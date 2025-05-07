@@ -8,7 +8,7 @@ pub struct File {
     id: String,
     path: String,
     file_type: String,
-    hash: String,
+    pub hash: String,
     created_at: String,
     updated_at: String,
 }
@@ -18,9 +18,8 @@ pub struct Database {
 }
 
 impl Database {
-    pub fn new(path_str: &Path) -> Result<Database, rusqlite::Error> {
+    pub fn new(path_str: &Path) -> rusqlite::Result<Database> {
         let conn = Connection::open(path_str)?;
-
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS files (
@@ -51,10 +50,8 @@ impl Database {
         path_str: &str,
         file_type: &str,
         hash: &str,
-    ) -> std::result::Result<File, rusqlite::Error> {
+    ) -> rusqlite::Result<File> {
         let id = Uuid::new_v4();
-        use rusqlite::Row;
-
         let file = self.conn.query_row(
             r#"
             INSERT INTO files (id, path, file_type, hash)
@@ -66,7 +63,7 @@ impl Database {
             RETURNING id, path, file_type, hash, created_at, updated_at;
             "#,
             [&id.to_string(), path_str, file_type, hash],
-            |row: &Row| {
+            |row| {
                 Ok(File {
                     id: row.get(0)?,
                     path: row.get(1)?,
@@ -80,7 +77,7 @@ impl Database {
         Ok(file)
     }
 
-    pub fn delete_file(&self, path: &str) -> std::result::Result<File, rusqlite::Error> {
+    pub fn delete_file(&self, path: &str) -> rusqlite::Result<File> {
         let file = self.conn.query_row(
             "DELETE FROM files WHERE path = ?1 RETURNING id, path, file_type, hash, created_at, updated_at",
             [path],
