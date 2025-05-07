@@ -16,3 +16,5 @@ rusqlite = "0.35.0"
 uuid = { version = "1.16.0", features = ["v4"] }
 blake3 = "1.8.2"
 directories = "6.0.0"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }

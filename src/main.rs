@@ -5,6 +5,8 @@ use std::path::Path;
 use tokio::fs;
 use tokio::io::{self, AsyncReadExt};
 use tokio::sync::mpsc;
+use tracing::{debug, error, info, warn};
+use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 mod db;
 use db::Database;
@@ -57,7 +59,7 @@ async fn handle_event(
 ) -> Result<FileEvent, Box<dyn std::error::Error>> {
     match event.kind {
         notify::EventKind::Create(_) => {
-            println!("File created");
+            info!("File created");
 
             for path in event.paths {
                 if let Ok(meta) = fs::metadata(&path).await {
@@ -65,61 +67,68 @@ async fn handle_event(
                         if let Some(path_str) = path.to_str() {
                             let file_type = get_file_type(path_str)?;
                             let hash = hash_file(path_str).await?;
-                            println!("\x1b[32mnew hash: {:?}\x1b[0m", hash);
+                            debug!("New file hash: {:?}", hash);
                             let file = db.create_file(path_str, &file_type, &hash)?;
+                            info!("Created file record for {}", path_str);
                             return Ok(FileEvent {
                                 kind: FileEventKind::NewFile,
                                 file,
                             });
                         } else {
+                            error!("Invalid UTF-8 path");
                             return Err("Invalid UTF-8 path".into());
                         }
                     }
                 }
             }
 
+            warn!("No valid files found in Create event");
             Err("No valid files found in Create event".into())
         }
 
         notify::EventKind::Modify(_) => {
-            println!("File modified: {:?}", event);
+            debug!("File modified: {:?}", event);
             for path in event.paths {
-                let metadata = fs::metadata(&path)
-                    .await
-                    .map_err(|e| format!("Could not read metadata {}", e))?;
+                let metadata = fs::metadata(&path).await.map_err(|e| {
+                    error!("Could not read metadata: {}", e);
+                    format!("Could not read metadata {}", e)
+                })?;
 
-                println!("\x1b[32m{:?}\x1b[0m", metadata);
+                debug!("File metadata: {:?}", metadata);
             }
 
+            debug!("Modify not handled");
             Err("Modify not handled".into())
         }
 
         notify::EventKind::Remove(_) => {
-            // println!("File removed");
+            info!("File removed");
             for path in event.paths {
                 if let Some(path_str) = path.to_str() {
                     let file = db.delete_file(path_str)?;
+                    info!("Deleted file record for {}", path_str);
                     return Ok(FileEvent {
                         kind: FileEventKind::Delete,
                         file,
                     });
                 }
             }
+            warn!("Remove event processed, but no FileEvent returned");
             Err("Remove event processed, but no FileEvent returned".into())
         }
 
         notify::EventKind::Access(_) => {
-            println!("File accessed");
+            debug!("File accessed");
             Err("Access event not handled".into())
         }
 
         notify::EventKind::Other => {
-            println!("Other event");
+            debug!("Other event");
             Err("Other event not handled".into())
         }
 
         _ => {
-            println!("Unhandled event: {:?}", event.kind);
+            warn!("Unhandled event: {:?}", event.kind);
             Err("Unhandled event type".into())
         }
     }
@@ -128,41 +137,71 @@ async fn handle_event(
 async fn init_config_dir() -> Result<Config, Box<dyn std::error::Error>> {
     let base_dirs = BaseDirs::new().expect("Couldn't find the base directory");
     let bako_config_dir = base_dirs.config_dir().join("io.tonythetaiga.bako");
+
     if !bako_config_dir.exists() {
+        info!("Creating config directory: {}", bako_config_dir.display());
         std::fs::create_dir(bako_config_dir.clone())?;
     }
 
-    if bako_config_dir.join("config.toml").exists() {
-        let data = fs::read_to_string(bako_config_dir.join("config.toml"))
-            .await
-            .map_err(|e| format!("Failed to read config toml! {}", e))?;
+    let config_path = bako_config_dir.join("config.toml");
+    if config_path.exists() {
+        info!("Reading existing config from {}", config_path.display());
+        let data = fs::read_to_string(&config_path).await.map_err(|e| {
+            error!("Failed to read config file: {}", e);
+            format!("Failed to read config toml! {}", e)
+        })?;
 
-        let cfg: Config =
-            toml::from_str(&data).map_err(|e| format!("Failed to parse config toml! {}", e))?;
+        let cfg: Config = toml::from_str(&data).map_err(|e| {
+            error!("Failed to parse config file: {}", e);
+            format!("Failed to parse config toml! {}", e)
+        })?;
 
+        debug!("Config loaded successfully");
         Ok(cfg)
     } else {
+        info!("Creating new default config at {}", config_path.display());
         let cfg = Config::new();
-        let data =
-            toml::to_string_pretty(&cfg).map_err(|e| format!("Failed to format toml! {}", e))?;
-        fs::write(bako_config_dir.join("config.toml"), data).await?;
+        let data = toml::to_string_pretty(&cfg).map_err(|e| {
+            error!("Failed to serialize config: {}", e);
+            format!("Failed to format toml! {}", e)
+        })?;
+        fs::write(&config_path, data).await?;
 
+        info!("Default config created successfully");
         Ok(cfg)
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Init / Read Config
-    // let cfg = init_config_dir().await?;
+    // Use only EnvFilter to respect RUST_LOG environment variable
+    let subscriber = FmtSubscriber::builder()
+        .with_env_filter(EnvFilter::from_default_env())
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
 
-    // Initialize database
+    let _ = init_config_dir().await?;
+
     let db_path = Path::new("bako.db");
+    info!("Initializing database at {}", db_path.display());
     let db = Database::new(db_path)?;
 
-    let embedder = embeddings::Embedder::new().await?;
+    info!("Initializing OpenAI embeddings client");
+    let embedder = match embeddings::Embedder::new().await {
+        Ok(embedder) => {
+            info!("Embeddings client initialized successfully");
+            embedder
+        }
+        Err(e) => {
+            warn!(
+                "Failed to initialize embeddings client: {}. Running without embeddings support.",
+                e
+            );
+            return Err(e);
+        }
+    };
 
-    // File Watcher
+    info!("Initializing file watcher");
     let (filewatcher_tx, mut filewatcher_rx) = mpsc::channel::<notify::Result<notify::Event>>(32);
     tokio::task::spawn_blocking(move || {
         let watcher_init = recommended_watcher(move |res: notify::Result<notify::Event>| {
@@ -170,19 +209,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
 
         if let Ok(mut watcher) = watcher_init {
-            watcher
-                .watch(
-                    Path::new("/Users/taigaishida/workspace/bako/data"),
-                    RecursiveMode::Recursive,
-                )
-                .unwrap();
+            let watch_path = Path::new("/Users/taigaishida/workspace/bako/data");
+            info!("Watching directory: {}", watch_path.display());
+            watcher.watch(watch_path, RecursiveMode::Recursive).unwrap();
             std::thread::park();
         } else {
-            println!("Failed to initialize watcher");
+            error!("Failed to initialize watcher");
         }
     });
 
-    // Event Handler(s)
+    info!("Setting up event handler");
     let (eventhandler_tx, mut eventhandler_rx) = mpsc::channel::<FileEvent>(32);
     tokio::spawn(async move {
         loop {
@@ -193,29 +229,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match file_event.kind {
                 FileEventKind::NewFile => {
-                    println!("New Event - {:?}", file_event);
-                    let file_dat = file_event.file.read().await.unwrap();
-                    println!("\x1b[94m{:?}\x1b[0m", file_dat);
-                    let embeddings = embedder.genereate_embeddings(&file_dat).await.unwrap();
-                    println!("\x1b[94m{:?}\x1b[0m", embeddings);
+                    info!("Processing new file event: {:?}", file_event.file.path);
+                    match file_event.file.read().await {
+                        Ok(file_dat) => {
+                            debug!("Read file content: {} characters", file_dat.len());
+                            info!("Generating embeddings for text ({} chars)", file_dat.len());
+                            debug!("Sending request to OpenAI embeddings API");
+                            match embedder.genereate_embeddings(&file_dat).await {
+                                Ok(embeddings) => {
+                                    debug!("Parsing embeddings response");
+                                    info!(
+                                        "Generated embeddings with dimension: {}",
+                                        embeddings.data[0].embedding.len()
+                                    );
+                                    debug!("Embedding response: {:?}", embeddings);
+                                }
+                                Err(e) => error!("Failed to generate embeddings: {}", e),
+                            }
+                        }
+                        Err(e) => error!("Failed to read file: {}", e),
+                    }
                 }
-                FileEventKind::Delete => println!("New Event - {:?}", file_event),
+                FileEventKind::Delete => info!("File deleted: {}", file_event.file.path),
             }
         }
     });
 
-    // Main Loop
+    info!("Starting main event loop");
     while let Some(result) = filewatcher_rx.recv().await {
         match result {
-            Ok(event) => match handle_event(event, &db).await {
-                Ok(fe) => {
-                    eventhandler_tx.send(fe).await?;
+            Ok(event) => {
+                debug!("Received file system event: {:?}", event.kind);
+                match handle_event(event, &db).await {
+                    Ok(fe) => match eventhandler_tx.send(fe).await {
+                        Ok(_) => debug!("Event sent to handler"),
+                        Err(e) => error!("Failed to send event to handler: {}", e),
+                    },
+                    Err(e) => error!("Error handling event: {:?}", e),
                 }
-                Err(e) => println!("Error handling event: {:?}", e),
-            },
-            Err(error) => println!("Failed to retrieve event: {:?}", error),
+            }
+            Err(error) => error!("Failed to retrieve event: {:?}", error),
         }
     }
+
+    info!("Exiting application");
 
     Ok(())
 }

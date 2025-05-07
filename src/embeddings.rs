@@ -26,15 +26,14 @@ pub struct Embedder {
 }
 
 fn get_openai_api_key() -> std::result::Result<String, Box<dyn std::error::Error>> {
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .map_err(|_| "Missing OPENAI_API_KEY environment variable")?;
-
-    Ok(api_key)
+    std::env::var("OPENAI_API_KEY")
+        .map_err(|_| "Missing OPENAI_API_KEY environment variable".into())
 }
 
 impl Embedder {
     pub async fn new() -> std::result::Result<Self, Box<dyn std::error::Error>> {
         let api_key = get_openai_api_key()?;
+
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::AUTHORIZATION,
@@ -44,10 +43,11 @@ impl Embedder {
             reqwest::header::CONTENT_TYPE,
             "application/json".parse().unwrap(),
         );
+
         let client = reqwest::Client::builder()
             .default_headers(headers)
             .build()
-            .map_err(|e| format!("failed to create http client {}", e))?;
+            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
         Ok(Embedder { client })
     }
@@ -64,8 +64,23 @@ impl Embedder {
                 "input": text_content,
             }))
             .send()
-            .await?;
-        let embedding_response: EmbeddingResponse = res.json().await?;
+            .await
+            .map_err(|e| format!("Failed to send embeddings request: {}", e))?;
+
+        if !res.status().is_success() {
+            let status = res.status();
+            let error_text = res
+                .text()
+                .await
+                .unwrap_or_else(|_| "Could not read error response".to_string());
+            return Err(format!("OpenAI API error: {} - {}", status, error_text).into());
+        }
+
+        let embedding_response: EmbeddingResponse = res
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse embeddings response: {}", e))?;
+
         Ok(embedding_response)
     }
 }
