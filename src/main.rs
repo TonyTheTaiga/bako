@@ -6,16 +6,13 @@ use tokio::fs;
 use tokio::io::{self, AsyncReadExt};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
-use tracing_subscriber::{EnvFilter, FmtSubscriber};
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 mod db;
 use db::Database;
-
 mod config;
 use config::Config;
-
 mod embeddings;
-
 mod file;
 
 #[derive(Debug)]
@@ -172,13 +169,29 @@ async fn init_config_dir() -> Result<Config, Box<dyn std::error::Error>> {
     }
 }
 
+fn init_logging() -> Result<(), Box<dyn std::error::Error>> {
+    let fmt_layer = fmt::layer()
+        .pretty()
+        .with_target(false)
+        .with_level(true)
+        .with_ansi(true)
+        .with_thread_ids(false)
+        .with_thread_names(false)
+        .with_file(false)
+        .with_line_number(false)
+        .with_writer(std::io::stdout);
+
+    let subscriber = tracing_subscriber::registry()
+        .with(EnvFilter::from_default_env())
+        .with(fmt_layer);
+
+    tracing::subscriber::set_global_default(subscriber)?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let subscriber = FmtSubscriber::builder()
-        .with_env_filter(EnvFilter::from_default_env())
-        .finish();
-    tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
-
+    init_logging()?;
     let _ = init_config_dir().await?;
 
     let db_path = Path::new("bako.db");
