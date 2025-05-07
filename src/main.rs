@@ -12,10 +12,20 @@ use db::Database;
 mod config;
 use config::Config;
 
+mod embeddings;
+
+mod file;
+
 #[derive(Debug)]
 struct FileEvent {
-    kind: String,
-    file: db::File,
+    kind: FileEventKind,
+    file: file::File,
+}
+
+#[derive(Debug)]
+enum FileEventKind {
+    NewFile,
+    Delete,
 }
 
 fn get_file_type(path_str: &str) -> io::Result<String> {
@@ -47,7 +57,7 @@ async fn handle_event(
 ) -> Result<FileEvent, Box<dyn std::error::Error>> {
     match event.kind {
         notify::EventKind::Create(_) => {
-            // println!("File created");
+            println!("File created");
 
             for path in event.paths {
                 if let Ok(meta) = fs::metadata(&path).await {
@@ -58,7 +68,7 @@ async fn handle_event(
                             println!("\x1b[32mnew hash: {:?}\x1b[0m", hash);
                             let file = db.create_file(path_str, &file_type, &hash)?;
                             return Ok(FileEvent {
-                                kind: "NewFile".into(),
+                                kind: FileEventKind::NewFile,
                                 file,
                             });
                         } else {
@@ -72,8 +82,16 @@ async fn handle_event(
         }
 
         notify::EventKind::Modify(_) => {
-            println!("File modified");
-            Err("Modify event not handled yet".into())
+            println!("File modified: {:?}", event);
+            for path in event.paths {
+                let metadata = fs::metadata(&path)
+                    .await
+                    .map_err(|e| format!("Could not read metadata {}", e))?;
+
+                println!("\x1b[32m{:?}\x1b[0m", metadata);
+            }
+
+            Err("Modify not handled".into())
         }
 
         notify::EventKind::Remove(_) => {
@@ -82,7 +100,7 @@ async fn handle_event(
                 if let Some(path_str) = path.to_str() {
                     let file = db.delete_file(path_str)?;
                     return Ok(FileEvent {
-                        kind: "Delete".into(),
+                        kind: FileEventKind::Delete,
                         file,
                     });
                 }
@@ -142,6 +160,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_path = Path::new("bako.db");
     let db = Database::new(db_path)?;
 
+    let embedder = embeddings::Embedder::new().await?;
+
     // File Watcher
     let (filewatcher_tx, mut filewatcher_rx) = mpsc::channel::<notify::Result<notify::Event>>(32);
     tokio::task::spawn_blocking(move || {
@@ -171,12 +191,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await
                 .expect("Empty message received!");
 
-            match file_event.kind.as_str() {
-                "NewFile" => {
+            match file_event.kind {
+                FileEventKind::NewFile => {
                     println!("New Event - {:?}", file_event);
+                    let file_dat = file_event.file.read().await.unwrap();
+                    println!("\x1b[94m{:?}\x1b[0m", file_dat);
+                    let embeddings = embedder.genereate_embeddings(&file_dat).await.unwrap();
+                    println!("\x1b[94m{:?}\x1b[0m", embeddings);
                 }
-                "Delete" => println!("New Event - {:?}", file_event),
-                _ => {}
+                FileEventKind::Delete => println!("New Event - {:?}", file_event),
             }
         }
     });
@@ -190,7 +213,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Err(e) => println!("Error handling event: {:?}", e),
             },
-            Err(error) => println!("Failed to initialize watcher! {:?}", error),
+            Err(error) => println!("Failed to retrieve event: {:?}", error),
         }
     }
 

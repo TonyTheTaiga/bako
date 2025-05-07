@@ -1,17 +1,8 @@
 use std::path::Path;
 
+use crate::file;
 use rusqlite::Connection;
 use uuid::Uuid;
-
-#[derive(Debug)]
-pub struct File {
-    id: String,
-    path: String,
-    file_type: String,
-    pub hash: String,
-    created_at: String,
-    updated_at: String,
-}
 
 pub struct Database {
     conn: Connection,
@@ -50,7 +41,7 @@ impl Database {
         path_str: &str,
         file_type: &str,
         hash: &str,
-    ) -> rusqlite::Result<File> {
+    ) -> rusqlite::Result<file::File> {
         let id = Uuid::new_v4();
         let file = self.conn.query_row(
             r#"
@@ -64,7 +55,7 @@ impl Database {
             "#,
             [&id.to_string(), path_str, file_type, hash],
             |row| {
-                Ok(File {
+                Ok(file::File {
                     id: row.get(0)?,
                     path: row.get(1)?,
                     file_type: row.get(2)?,
@@ -77,12 +68,12 @@ impl Database {
         Ok(file)
     }
 
-    pub fn delete_file(&self, path: &str) -> rusqlite::Result<File> {
+    pub fn delete_file(&self, path: &str) -> rusqlite::Result<file::File> {
         let file = self.conn.query_row(
             "DELETE FROM files WHERE path = ?1 RETURNING id, path, file_type, hash, created_at, updated_at",
             [path],
             |row| {
-                Ok(File {
+                Ok(file::File {
                     id: row.get(0)?,
                     path: row.get(1)?,
                     file_type: row.get(2)?,
