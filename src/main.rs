@@ -174,7 +174,6 @@ async fn init_config_dir() -> Result<Config, Box<dyn std::error::Error>> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Use only EnvFilter to respect RUST_LOG environment variable
     let subscriber = FmtSubscriber::builder()
         .with_env_filter(EnvFilter::from_default_env())
         .finish();

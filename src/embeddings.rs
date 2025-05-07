@@ -23,6 +23,8 @@ pub struct Usage {
 
 pub struct Embedder {
     client: reqwest::Client,
+    model: String,
+    dimensions: usize,
 }
 
 fn get_openai_api_key() -> std::result::Result<String, Box<dyn std::error::Error>> {
@@ -49,7 +51,11 @@ impl Embedder {
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
-        Ok(Embedder { client })
+        Ok(Embedder {
+            client,
+            model: "text-embedding-3-small".to_string(),
+            dimensions: 512,
+        })
     }
 
     pub async fn genereate_embeddings(
@@ -60,8 +66,9 @@ impl Embedder {
             .client
             .post("https://api.openai.com/v1/embeddings")
             .json(&serde_json::json!({
-                "model": "text-embedding-3-small",
+                "model": self.model,
                 "input": text_content,
+                "dimensions": self.dimensions,
             }))
             .send()
             .await
