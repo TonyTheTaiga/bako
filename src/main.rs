@@ -47,7 +47,6 @@ async fn queue_create_event(
         if let Ok(meta) = fs::metadata(&path).await {
             if meta.is_file() {
                 if let Some(path_str) = path.to_str() {
-                    // Queue the create event for later processing
                     db.queue_file_event(path_str, db::FileEventType::Create)?;
                     info!("Queued create event for {}", path_str);
                     return Ok(());
@@ -93,7 +92,6 @@ async fn queue_remove_event(
     info!("File removed event received");
     for path in paths {
         if let Some(path_str) = path.to_str() {
-            // Queue the delete event for later processing
             db.queue_file_event(path_str, db::FileEventType::Delete)?;
             info!("Queued delete event for {}", path_str);
         } else {
@@ -104,7 +102,7 @@ async fn queue_remove_event(
     Ok(())
 }
 
-async fn handle_event(
+async fn handle_fs_event(
     event: notify::Event,
     db: &Database,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -364,7 +362,7 @@ async fn run_main_event_loop(
                 match result {
                     Ok(event) => {
                         debug!("Received file system event: {:?}", event.kind);
-                        if let Err(e) = handle_event(event, db).await {
+                        if let Err(e) = handle_fs_event(event, db).await {
                             error!("Error handling event: {:?}", e);
                         }
                     }
