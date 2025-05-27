@@ -52,7 +52,6 @@ async fn hash_file(path: &str) -> io::Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-
 async fn queue_create_event(
     paths: Vec<PathBuf>,
     db: &Database,
@@ -126,15 +125,9 @@ async fn handle_event(
     db: &Database,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match event.kind {
-        notify::EventKind::Create(_) => {
-            queue_create_event(event.paths, db).await
-        }
-        notify::EventKind::Modify(_) => {
-            queue_modify_event(event.paths, db).await
-        }
-        notify::EventKind::Remove(_) => {
-            queue_remove_event(event.paths, db).await
-        }
+        notify::EventKind::Create(_) => queue_create_event(event.paths, db).await,
+        notify::EventKind::Modify(_) => queue_modify_event(event.paths, db).await,
+        notify::EventKind::Remove(_) => queue_remove_event(event.paths, db).await,
         notify::EventKind::Access(_) => {
             debug!("File accessed - ignoring");
             Ok(()) // Just ignore access events
@@ -188,26 +181,6 @@ async fn init_config_dir() -> Result<Config, Box<dyn std::error::Error>> {
     }
 }
 
-fn init_logging() -> Result<(), Box<dyn std::error::Error>> {
-    let fmt_layer = fmt::layer()
-        .pretty()
-        .with_target(false)
-        .with_level(true)
-        .with_ansi(true)
-        .with_thread_ids(false)
-        .with_thread_names(false)
-        .with_file(false)
-        .with_line_number(false)
-        .with_writer(std::io::stdout);
-
-    let subscriber = tracing_subscriber::registry()
-        .with(EnvFilter::from_default_env())
-        .with(fmt_layer);
-
-    tracing::subscriber::set_global_default(subscriber)?;
-    Ok(())
-}
-
 async fn init_app() -> Result<(Database, embeddings::Embedder), Box<dyn std::error::Error>> {
     logging::init()?;
     let _config = init_config_dir().await?;
@@ -233,7 +206,8 @@ async fn init_app() -> Result<(Database, embeddings::Embedder), Box<dyn std::err
     Ok((db, embedder))
 }
 
-fn setup_file_watcher() -> Result<mpsc::Receiver<notify::Result<notify::Event>>, Box<dyn std::error::Error>> {
+fn setup_file_watcher()
+-> Result<mpsc::Receiver<notify::Result<notify::Event>>, Box<dyn std::error::Error>> {
     info!("Initializing file watcher");
     let (filewatcher_tx, filewatcher_rx) = mpsc::channel::<notify::Result<notify::Event>>(32);
     tokio::task::spawn_blocking(move || {
@@ -261,8 +235,10 @@ fn setup_file_watcher() -> Result<mpsc::Receiver<notify::Result<notify::Event>>,
     Ok(filewatcher_rx)
 }
 
-
-async fn process_file_events(mut eventhandler_rx: mpsc::Receiver<FileEvent>, embedder: embeddings::Embedder) {
+async fn process_file_events(
+    mut eventhandler_rx: mpsc::Receiver<FileEvent>,
+    embedder: embeddings::Embedder,
+) {
     info!("Event handler task started");
     loop {
         let file_event = match eventhandler_rx.recv().await {
@@ -280,8 +256,11 @@ async fn process_file_events(mut eventhandler_rx: mpsc::Receiver<FileEvent>, emb
                     FileEventKind::Modify => "modified",
                     _ => unreachable!(),
                 };
-                
-                info!("Processing {} file event: {:?}", event_type, file_event.file.path);
+
+                info!(
+                    "Processing {} file event: {:?}",
+                    event_type, file_event.file.path
+                );
                 match file_event.file.read().await {
                     Ok(file_dat) => {
                         debug!("Read file content: {} characters", file_dat.len());
@@ -307,15 +286,18 @@ async fn process_file_events(mut eventhandler_rx: mpsc::Receiver<FileEvent>, emb
     }
 }
 
-
 // Process a single queued event
 async fn process_queued_event(
     event: db::QueuedEvent,
     db: &Database,
     embedder: &embeddings::Embedder,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    info!("Processing queued event: {} for path: {}", event.event_type.to_string(), event.path);
-    
+    info!(
+        "Processing queued event: {} for path: {}",
+        event.event_type.to_string(),
+        event.path
+    );
+
     match event.event_type {
         db::FileEventType::Create | db::FileEventType::Modify => {
             let path_str = &event.path;
@@ -324,18 +306,18 @@ async fn process_queued_event(
                 db::FileEventType::Modify => "modified",
                 _ => unreachable!(),
             };
-            
+
             // Check if file still exists
             if !Path::new(path_str).exists() {
                 warn!("File no longer exists: {}, skipping processing", path_str);
                 db.mark_event_processed(&event.id, &event.path, event.created_at)?;
                 return Ok(());
             }
-            
+
             // Get file type and hash
             let file_type = get_file_type(path_str)?;
             let hash = hash_file(path_str).await?;
-            
+
             // Update or create file record
             let file = match event.event_type {
                 db::FileEventType::Create => {
@@ -343,20 +325,24 @@ async fn process_queued_event(
                     let file = db.create_file(path_str, &file_type, &hash)?;
                     info!("Created file record for {}", path_str);
                     file
-                },
+                }
                 db::FileEventType::Modify => {
                     debug!("Modified file hash: {:?}", hash);
                     let file = db.update_file(path_str, &file_type, &hash)?;
                     info!("Updated file record for {}", path_str);
                     file
-                },
+                }
                 _ => unreachable!(),
             };
-            
+
             // Generate embeddings
             match file.read().await {
                 Ok(file_dat) => {
-                    debug!("Read {} file content: {} characters", event_type_str, file_dat.len());
+                    debug!(
+                        "Read {} file content: {} characters",
+                        event_type_str,
+                        file_dat.len()
+                    );
                     info!("Generating embeddings for text ({} chars)", file_dat.len());
                     debug!("Sending request to OpenAI embeddings API");
                     match embedder.genereate_embeddings(&file_dat).await {
@@ -373,7 +359,7 @@ async fn process_queued_event(
                 }
                 Err(e) => error!("Failed to read file: {}", e),
             }
-        },
+        }
         db::FileEventType::Delete => {
             let path_str = &event.path;
             // Delete file from database
@@ -384,9 +370,9 @@ async fn process_queued_event(
                     // Still mark as processed even if there was an error
                 }
             }
-        },
+        }
     }
-    
+
     // Mark event as processed
     db.mark_event_processed(&event.id, &event.path, event.created_at)?;
     Ok(())
@@ -400,19 +386,22 @@ async fn process_event_queue(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Get the total queue size
     let queue_size = db.get_queue_size()?;
-    info!("Processing event queue (queue size: {}, batch size: {})", queue_size, batch_size);
-    
+    info!(
+        "Processing event queue (queue size: {}, batch size: {})",
+        queue_size, batch_size
+    );
+
     // Get pending events
     let events = db.get_pending_events(batch_size)?;
     let event_count = events.len();
-    
+
     if event_count == 0 {
         debug!("No pending events to process");
         return Ok(());
     }
-    
+
     info!("Found {} pending events to process", event_count);
-    
+
     // Process each event
     for event in events {
         if let Err(e) = process_queued_event(event, db, embedder).await {
@@ -420,7 +409,7 @@ async fn process_event_queue(
             // Continue processing other events even if one fails
         }
     }
-    
+
     Ok(())
 }
 
@@ -432,10 +421,10 @@ async fn run_main_event_loop(
     batch_size: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting main event loop");
-    
+
     // Create a periodic timer for processing the event queue
     let mut interval = tokio::time::interval(process_interval);
-    
+
     loop {
         tokio::select! {
             // Process file system events
@@ -450,14 +439,14 @@ async fn run_main_event_loop(
                     Err(error) => error!("Failed to retrieve event: {:?}", error),
                 }
             }
-            
+
             // Process the event queue on interval
             _ = interval.tick() => {
                 if let Err(e) = process_event_queue(db, embedder, batch_size).await {
                     error!("Error processing event queue: {}", e);
                 }
             }
-            
+
             // Exit if both channels are closed
             else => {
                 info!("All channels closed, exiting main loop");
@@ -465,7 +454,7 @@ async fn run_main_event_loop(
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -478,9 +467,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Configure the queue processing parameters
     let process_interval = std::time::Duration::from_secs(60); // Process queue every 5 seconds
     let batch_size = 10; // Process up to 10 events per batch
-    
-    info!("Starting queue-based event processing (interval: {:?}, batch size: {})", 
-          process_interval, batch_size);
+
+    info!(
+        "Starting queue-based event processing (interval: {:?}, batch size: {})",
+        process_interval, batch_size
+    );
 
     // Run the main event loop with queue processing
     run_main_event_loop(filewatcher_rx, &db, &embedder, process_interval, batch_size).await?;
