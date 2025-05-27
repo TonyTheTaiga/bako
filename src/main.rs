@@ -14,6 +14,7 @@ mod config;
 use config::Config;
 mod embeddings;
 mod file;
+mod logging;
 
 #[derive(Debug)]
 struct FileEvent {
@@ -191,7 +192,7 @@ fn init_logging() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    init_logging()?;
+    logging::init()?;
     let _ = init_config_dir().await?;
 
     let db_path = Path::new("bako.db");
