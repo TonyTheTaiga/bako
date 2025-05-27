@@ -1,7 +1,7 @@
 use blake3::Hasher;
 use directories::BaseDirs;
 use notify::{RecursiveMode, Watcher, recommended_watcher};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tokio::fs;
 use tokio::io::{self, AsyncReadExt};
 use tokio::sync::mpsc;
@@ -38,91 +38,17 @@ async fn hash_file(path: &str) -> io::Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-async fn queue_create_event(
-    paths: Vec<PathBuf>,
+async fn handle_file_event(
+    event: db::FileEvent,
     db: &Database,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    info!("File created event received");
-    for path in paths {
-        if let Ok(meta) = fs::metadata(&path).await {
-            if meta.is_file() {
-                if let Some(path_str) = path.to_str() {
-                    db.queue_file_event(path_str, db::FileEventType::Create)?;
-                    info!("Queued create event for {}", path_str);
-                    return Ok(());
-                } else {
-                    error!("Invalid UTF-8 path in create event");
-                    return Err("Invalid UTF-8 path".into());
-                }
-            }
-        }
-    }
-    warn!("No valid files found in Create event");
-    Err("No valid files found in Create event".into())
-}
-
-async fn queue_modify_event(
-    paths: Vec<PathBuf>,
-    db: &Database,
-) -> Result<(), Box<dyn std::error::Error>> {
-    info!("File modified event received");
-    for path in paths {
-        if let Ok(meta) = fs::metadata(&path).await {
-            if meta.is_file() {
-                if let Some(path_str) = path.to_str() {
-                    // Queue the modify event for later processing
-                    db.queue_file_event(path_str, db::FileEventType::Modify)?;
-                    info!("Queued modify event for {}", path_str);
-                    return Ok(());
-                } else {
-                    error!("Invalid UTF-8 path in modify event");
-                    return Err("Invalid UTF-8 path".into());
-                }
-            }
-        }
-    }
-    warn!("No valid files found in Modify event");
-    Err("No valid files found in Modify event".into())
-}
-
-async fn queue_remove_event(
-    paths: Vec<PathBuf>,
-    db: &Database,
-) -> Result<(), Box<dyn std::error::Error>> {
-    info!("File removed event received");
-    for path in paths {
-        if let Some(path_str) = path.to_str() {
-            db.queue_file_event(path_str, db::FileEventType::Delete)?;
-            info!("Queued delete event for {}", path_str);
-        } else {
-            error!("Invalid UTF-8 path in remove event");
-            return Err("Invalid UTF-8 path in remove event".into());
-        }
-    }
+    info!(
+        "File event received: {} for {}",
+        event.event_type, event.path
+    );
+    db.queue_file_event(&event.path, event.event_type)?;
+    info!("Queued {} event for {}", event.event_type, event.path);
     Ok(())
-}
-
-async fn handle_fs_event(
-    event: notify::Event,
-    db: &Database,
-) -> Result<(), Box<dyn std::error::Error>> {
-    match event.kind {
-        notify::EventKind::Create(_) => queue_create_event(event.paths, db).await,
-        notify::EventKind::Modify(_) => queue_modify_event(event.paths, db).await,
-        notify::EventKind::Remove(_) => queue_remove_event(event.paths, db).await,
-        notify::EventKind::Access(_) => {
-            debug!("File accessed - ignoring");
-            Ok(()) // Just ignore access events
-        }
-        notify::EventKind::Other => {
-            debug!("Other event - ignoring");
-            Ok(()) // Just ignore other events
-        }
-        _ => {
-            warn!("Unhandled event: {:?} - ignoring", event.kind);
-            Ok(()) // Ignore unhandled events
-        }
-    }
 }
 
 async fn init_config_dir() -> Result<Config, Box<dyn std::error::Error>> {
@@ -188,16 +114,27 @@ async fn init_app() -> Result<(Database, embeddings::Embedder), Box<dyn std::err
     Ok((db, embedder))
 }
 
-fn setup_file_watcher()
--> Result<mpsc::Receiver<notify::Result<notify::Event>>, Box<dyn std::error::Error>> {
+fn setup_file_watcher() -> Result<mpsc::Receiver<db::FileEvent>, Box<dyn std::error::Error>> {
     info!("Initializing file watcher");
-    let (filewatcher_tx, filewatcher_rx) = mpsc::channel::<notify::Result<notify::Event>>(32);
+    let (filewatcher_tx, filewatcher_rx) = mpsc::channel::<db::FileEvent>(32);
     tokio::task::spawn_blocking(move || {
-        let watcher_init_result = recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if filewatcher_tx.blocking_send(res).is_err() {
-                error!("Failed to send event from watcher to channel. Receiver likely dropped.");
-            }
-        });
+        let watcher_init_result =
+            recommended_watcher(move |res: notify::Result<notify::Event>| match res {
+                Ok(event) => {
+                    let file_events = db::FileEvent::from_notify_event(event);
+                    for file_event in file_events {
+                        if filewatcher_tx.blocking_send(file_event).is_err() {
+                            error!(
+                                "Failed to send file event to channel. Receiver likely dropped."
+                            );
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("File watcher error: {}", e);
+                }
+            });
 
         match watcher_init_result {
             Ok(mut watcher) => {
@@ -217,111 +154,17 @@ fn setup_file_watcher()
     Ok(filewatcher_rx)
 }
 
-async fn process_queued_event(
-    event: db::QueuedEvent,
-    db: &Database,
-    embedder: &embeddings::Embedder,
-) -> Result<(), Box<dyn std::error::Error>> {
-    info!(
-        "Processing queued event: {} for path: {}",
-        event.event_type.to_string(),
-        event.path
-    );
-
-    match event.event_type {
-        db::FileEventType::Create | db::FileEventType::Modify => {
-            let path_str = &event.path;
-            let event_type_str = match event.event_type {
-                db::FileEventType::Create => "new",
-                db::FileEventType::Modify => "modified",
-                _ => unreachable!(),
-            };
-
-            // Check if file still exists
-            if !Path::new(path_str).exists() {
-                warn!("File no longer exists: {}, skipping processing", path_str);
-                db.mark_event_processed(&event.id, &event.path, event.created_at)?;
-                return Ok(());
-            }
-
-            // Get file type and hash
-            let file_type = get_file_type(path_str)?;
-            let hash = hash_file(path_str).await?;
-
-            // Update or create file record
-            let file = match event.event_type {
-                db::FileEventType::Create => {
-                    debug!("New file hash: {:?}", hash);
-                    let file = db.create_file(path_str, &file_type, &hash)?;
-                    info!("Created file record for {}", path_str);
-                    file
-                }
-                db::FileEventType::Modify => {
-                    debug!("Modified file hash: {:?}", hash);
-                    let file = db.update_file(path_str, &file_type, &hash)?;
-                    info!("Updated file record for {}", path_str);
-                    file
-                }
-                _ => unreachable!(),
-            };
-
-            // Generate embeddings
-            match file.read().await {
-                Ok(file_dat) => {
-                    debug!(
-                        "Read {} file content: {} characters",
-                        event_type_str,
-                        file_dat.len()
-                    );
-                    info!("Generating embeddings for text ({} chars)", file_dat.len());
-                    debug!("Sending request to OpenAI embeddings API");
-                    match embedder.genereate_embeddings(&file_dat).await {
-                        Ok(embeddings) => {
-                            debug!("Parsing embeddings response");
-                            info!(
-                                "Generated embeddings with dimension: {}",
-                                embeddings.data[0].embedding.len()
-                            );
-                            debug!("Embedding response: {:?}", embeddings);
-                        }
-                        Err(e) => error!("Failed to generate embeddings: {}", e),
-                    }
-                }
-                Err(e) => error!("Failed to read file: {}", e),
-            }
-        }
-        db::FileEventType::Delete => {
-            let path_str = &event.path;
-            // Delete file from database
-            match db.delete_file(path_str) {
-                Ok(_file) => info!("Deleted file record for {}", path_str),
-                Err(e) => {
-                    error!("Failed to delete file record: {}", e);
-                    // Still mark as processed even if there was an error
-                }
-            }
-        }
-    }
-
-    // Mark event as processed
-    db.mark_event_processed(&event.id, &event.path, event.created_at)?;
-    Ok(())
-}
-
-// Process the event queue periodically
 async fn process_event_queue(
     db: &Database,
     embedder: &embeddings::Embedder,
     batch_size: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Get the total queue size
     let queue_size = db.get_queue_size()?;
     info!(
         "Processing event queue (queue size: {}, batch size: {})",
         queue_size, batch_size
     );
 
-    // Get pending events
     let events = db.get_pending_events(batch_size)?;
     let event_count = events.len();
 
@@ -332,11 +175,117 @@ async fn process_event_queue(
 
     info!("Found {} pending events to process", event_count);
 
-    // Process each event
+    let mut file_operations = Vec::new();
+    let mut mark_processed_operations = Vec::new();
+    let mut delete_operations = Vec::new();
+    let mut files_for_embeddings = Vec::new();
+
     for event in events {
-        if let Err(e) = process_queued_event(event, db, embedder).await {
-            error!("Error processing event: {}", e);
-            // Continue processing other events even if one fails
+        match event.event_type {
+            db::FileEventType::Create | db::FileEventType::Modify => {
+                let path_str = &event.path;
+
+                // Check if file still exists
+                if !Path::new(path_str).exists() {
+                    warn!("File no longer exists: {}, skipping processing", path_str);
+                    mark_processed_operations.push((
+                        event.id.clone(),
+                        event.path.clone(),
+                        event.created_at,
+                    ));
+                    continue;
+                }
+
+                // Get file type and hash
+                match get_file_type(path_str) {
+                    Ok(file_type) => match hash_file(path_str).await {
+                        Ok(hash) => {
+                            file_operations.push((event.path.clone(), file_type, hash));
+                            files_for_embeddings.push((event.path.clone(), event.event_type));
+                            mark_processed_operations.push((
+                                event.id,
+                                event.path,
+                                event.created_at,
+                            ));
+                        }
+                        Err(e) => {
+                            error!("Failed to hash file {}: {}", path_str, e);
+                            mark_processed_operations.push((
+                                event.id,
+                                event.path,
+                                event.created_at,
+                            ));
+                        }
+                    },
+                    Err(e) => {
+                        error!("Failed to get file type for {}: {}", path_str, e);
+                        mark_processed_operations.push((event.id, event.path, event.created_at));
+                    }
+                }
+            }
+            db::FileEventType::Delete => {
+                delete_operations.push(event.path.clone());
+                mark_processed_operations.push((event.id, event.path, event.created_at));
+            }
+        }
+    }
+
+    // Execute batch operations
+    if !file_operations.is_empty() {
+        match db.batch_create_or_update_files(file_operations) {
+            Ok(files) => {
+                info!("Batch created/updated {} files", files.len());
+
+                // Process embeddings for successfully created/updated files
+                for (path, event_type) in files_for_embeddings {
+                    let event_type_str = match event_type {
+                        db::FileEventType::Create => "new",
+                        db::FileEventType::Modify => "modified",
+                        _ => continue,
+                    };
+
+                    // Generate embeddings for this file
+                    if let Ok(file_content) = tokio::fs::read_to_string(&path).await {
+                        debug!(
+                            "Read {} file content: {} characters",
+                            event_type_str,
+                            file_content.len()
+                        );
+                        info!(
+                            "Generating embeddings for text ({} chars)",
+                            file_content.len()
+                        );
+
+                        match embedder.genereate_embeddings(&file_content).await {
+                            Ok(embeddings) => {
+                                info!(
+                                    "Generated embeddings with dimension: {}",
+                                    embeddings.data[0].embedding.len()
+                                );
+                                debug!("Embedding response: {:?}", embeddings);
+                            }
+                            Err(e) => error!("Failed to generate embeddings for {}: {}", path, e),
+                        }
+                    } else {
+                        error!("Failed to read file content for embeddings: {}", path);
+                    }
+                }
+            }
+            Err(e) => error!("Batch file operations failed: {}", e),
+        }
+    }
+
+    for path in delete_operations {
+        match db.delete_file(&path) {
+            Ok(_) => info!("Deleted file record for {}", path),
+            Err(e) => error!("Failed to delete file record for {}: {}", path, e),
+        }
+    }
+
+    if !mark_processed_operations.is_empty() {
+        match db.batch_mark_processed(mark_processed_operations) {
+            Ok(updated_count) => info!("Marked {} events as processed", updated_count),
+            Err(e) => error!("Failed to mark events as processed: {}", e),
         }
     }
 
@@ -344,7 +293,7 @@ async fn process_event_queue(
 }
 
 async fn run_main_event_loop(
-    mut filewatcher_rx: mpsc::Receiver<notify::Result<notify::Event>>,
+    mut filewatcher_rx: mpsc::Receiver<db::FileEvent>,
     db: &Database,
     embedder: &embeddings::Embedder,
     process_interval: std::time::Duration,
@@ -358,15 +307,10 @@ async fn run_main_event_loop(
     loop {
         tokio::select! {
             // Process file system events
-            Some(result) = filewatcher_rx.recv() => {
-                match result {
-                    Ok(event) => {
-                        debug!("Received file system event: {:?}", event.kind);
-                        if let Err(e) = handle_fs_event(event, db).await {
-                            error!("Error handling event: {:?}", e);
-                        }
-                    }
-                    Err(error) => error!("Failed to retrieve event: {:?}", error),
+            Some(event) = filewatcher_rx.recv() => {
+                debug!("Received file system event: {} for {}", event.event_type, event.path);
+                if let Err(e) = handle_file_event(event, db).await {
+                    error!("Error handling event: {:?}", e);
                 }
             }
 
@@ -391,19 +335,15 @@ async fn run_main_event_loop(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (db, embedder) = init_app().await?;
-
     let filewatcher_rx = setup_file_watcher()?;
-
-    // Configure the queue processing parameters
-    let process_interval = std::time::Duration::from_secs(60); // Process queue every 5 seconds
-    let batch_size = 10; // Process up to 10 events per batch
+    let process_interval = std::time::Duration::from_secs(60);
+    let batch_size = 10;
 
     info!(
         "Starting queue-based event processing (interval: {:?}, batch size: {})",
         process_interval, batch_size
     );
 
-    // Run the main event loop with queue processing
     run_main_event_loop(filewatcher_rx, &db, &embedder, process_interval, batch_size).await?;
 
     info!("Exiting application");

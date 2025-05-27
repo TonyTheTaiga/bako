@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FileEventType {
     Create,
     Modify,
@@ -40,6 +41,40 @@ pub struct QueuedEvent {
     pub event_type: FileEventType,
     pub created_at: i64,
     pub processed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileEvent {
+    pub path: String,
+    pub event_type: FileEventType,
+}
+
+impl FileEvent {
+    pub fn from_notify_event(event: notify::Event) -> Vec<FileEvent> {
+        let mut file_events = Vec::new();
+
+        let event_type = match event.kind {
+            notify::EventKind::Create(_) => Some(FileEventType::Create),
+            notify::EventKind::Modify(_) => Some(FileEventType::Modify),
+            notify::EventKind::Remove(_) => Some(FileEventType::Delete),
+            notify::EventKind::Access(_) | notify::EventKind::Other | _ => None,
+        };
+
+        if let Some(event_type) = event_type {
+            for path in event.paths {
+                if let Some(path_str) = path.to_str() {
+                    if path.is_file() {
+                        file_events.push(FileEvent {
+                            path: path_str.to_string(),
+                            event_type,
+                        });
+                    }
+                }
+            }
+        }
+
+        file_events
+    }
 }
 
 pub struct Database {
@@ -86,79 +121,6 @@ impl Database {
         )?;
 
         Ok(Database { conn })
-    }
-
-    pub fn create_file(
-        &self,
-        path_str: &str,
-        file_type: &str,
-        hash: &str,
-    ) -> rusqlite::Result<file::File> {
-        let id = Uuid::new_v4();
-        let file = self.conn.query_row(
-            r#"
-            INSERT INTO files (id, path, file_type, hash)
-            VALUES (?1, ?2, ?3, ?4)
-            ON CONFLICT(path) DO UPDATE SET
-                file_type = excluded.file_type,
-                hash = excluded.hash,
-                updated_at = CURRENT_TIMESTAMP
-            RETURNING id, path, file_type, hash, created_at, updated_at;
-            "#,
-            [&id.to_string(), path_str, file_type, hash],
-            |row| {
-                Ok(file::File {
-                    id: row.get(0)?,
-                    path: row.get(1)?,
-                    file_type: row.get(2)?,
-                    hash: row.get(3)?,
-                    created_at: row.get(4)?,
-                    updated_at: row.get(5)?,
-                })
-            },
-        )?;
-        Ok(file)
-    }
-
-    pub fn update_file(
-        &self,
-        path_str: &str,
-        file_type: &str,
-        hash: &str,
-    ) -> rusqlite::Result<file::File> {
-        let rows_updated = self.conn.execute(
-            "UPDATE files SET file_type = ?2, hash = ?3, updated_at = CURRENT_TIMESTAMP WHERE path = ?1",
-            params![path_str, file_type, hash],
-        )?;
-
-        if rows_updated == 0 {
-            // File didn't exist for update, so treat as create
-            warn!(
-                "Path {} not found for update in 'files' table, attempting to create.",
-                path_str
-            );
-            self.create_file(path_str, file_type, hash)
-        } else {
-            // File was updated, now fetch it to return
-            debug!(
-                "Path {} updated successfully in 'files' table, fetching.",
-                path_str
-            );
-            self.conn.query_row(
-                "SELECT id, path, file_type, hash, created_at, updated_at FROM files WHERE path = ?1",
-                [path_str],
-                |row| {
-                    Ok(file::File {
-                        id: row.get(0)?,
-                        path: row.get(1)?,
-                        file_type: row.get(2)?,
-                        hash: row.get(3)?,
-                        created_at: row.get(4)?,
-                        updated_at: row.get(5)?,
-                    })
-                },
-            )
-        }
     }
 
     pub fn delete_file(&self, path: &str) -> rusqlite::Result<file::File> {
@@ -232,41 +194,6 @@ impl Database {
         Ok(events)
     }
 
-    // Mark an event as processed
-    pub fn mark_event_processed(
-        &self,
-        processed_event_id: &str,
-        processed_event_path: &str,
-        processed_event_created_at: i64,
-    ) -> rusqlite::Result<usize> {
-        debug!(
-            "Marking event id {} (path: {}, created_at: {}) and older events for this path as processed.",
-            processed_event_id, processed_event_path, processed_event_created_at
-        );
-        let rows_updated = self.conn.execute(
-            "UPDATE file_events
-             SET processed = 1
-             WHERE path = ?1 AND created_at <= ?2 AND processed = 0",
-            params![processed_event_path, processed_event_created_at],
-        )?;
-
-        if rows_updated == 0 {
-            // This might happen if the event was already marked processed by another thread/instance (if scaled),
-            // or if there's a logic mismatch. For a single-threaded processor, this implies it might have already been marked.
-            // We can log this as a warning, as it's unexpected if get_pending_events just returned it as unprocessed.
-            warn!(
-                "mark_event_processed: No rows updated for path '{}' at/before timestamp {}. Specific event id {} was targeted. It might have been processed concurrently or already processed.",
-                processed_event_path, processed_event_created_at, processed_event_id
-            );
-            // As a safeguard, ensure the specific event ID is marked if the broader query missed it for some reason.
-            // This could happen if `created_at` wasn't precise enough or if there's an unexpected state.
-            // However, if the main query is correct, this specific update should ideally not be necessary or only update 0 rows.
-            // return self.conn.execute("UPDATE file_events SET processed = 1 WHERE id = ?1 AND processed = 0", params![processed_event_id]);
-        }
-        Ok(rows_updated)
-    }
-
-    // Get the total number of unprocessed events in the queue
     pub fn get_queue_size(&self) -> rusqlite::Result<usize> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM file_events WHERE processed = 0",
@@ -275,5 +202,78 @@ impl Database {
         )?;
 
         Ok(count as usize)
+    }
+
+    pub fn batch_create_or_update_files(
+        &self,
+        operations: Vec<(String, String, String)>, // (path, file_type, hash)
+    ) -> rusqlite::Result<Vec<file::File>> {
+        let mut files = Vec::new();
+
+        let tx = self.conn.unchecked_transaction()?;
+
+        for (path_str, file_type, hash) in operations {
+            let id = Uuid::new_v4();
+            let file = tx.query_row(
+                r#"
+                INSERT INTO files (id, path, file_type, hash)
+                VALUES (?1, ?2, ?3, ?4)
+                ON CONFLICT(path) DO UPDATE SET
+                    file_type = excluded.file_type,
+                    hash = excluded.hash,
+                    updated_at = CURRENT_TIMESTAMP
+                RETURNING id, path, file_type, hash, created_at, updated_at;
+                "#,
+                [&id.to_string(), &path_str, &file_type, &hash],
+                |row| {
+                    Ok(file::File {
+                        id: row.get(0)?,
+                        path: row.get(1)?,
+                        file_type: row.get(2)?,
+                        hash: row.get(3)?,
+                        created_at: row.get(4)?,
+                        updated_at: row.get(5)?,
+                    })
+                },
+            )?;
+            files.push(file);
+        }
+
+        tx.commit()?;
+        Ok(files)
+    }
+
+    pub fn batch_mark_processed(
+        &self,
+        operations: Vec<(String, String, i64)>, // (event_id, path, created_at)
+    ) -> rusqlite::Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut total_updated = 0;
+
+        for (event_id, path, created_at) in operations {
+            debug!(
+                "Marking event id {} (path: {}, created_at: {}) and older events for this path as processed.",
+                event_id, path, created_at
+            );
+
+            let rows_updated = tx.execute(
+                "UPDATE file_events
+                 SET processed = 1
+                 WHERE path = ?1 AND created_at <= ?2 AND processed = 0",
+                params![path, created_at],
+            )?;
+
+            if rows_updated == 0 {
+                warn!(
+                    "batch_mark_processed: No rows updated for path '{}' at/before timestamp {}. Event id {} was targeted.",
+                    path, created_at, event_id
+                );
+            }
+
+            total_updated += rows_updated;
+        }
+
+        tx.commit()?;
+        Ok(total_updated)
     }
 }
