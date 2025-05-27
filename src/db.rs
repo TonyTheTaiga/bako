@@ -57,7 +57,8 @@ impl FileEvent {
             notify::EventKind::Create(_) => Some(FileEventType::Create),
             notify::EventKind::Modify(_) => Some(FileEventType::Modify),
             notify::EventKind::Remove(_) => Some(FileEventType::Delete),
-            notify::EventKind::Access(_) | notify::EventKind::Other | _ => None,
+            notify::EventKind::Access(_) | notify::EventKind::Other => None,
+            _ => None,
         };
 
         if let Some(event_type) = event_type {
