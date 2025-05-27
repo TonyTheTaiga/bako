@@ -6,7 +6,6 @@ use tokio::fs;
 use tokio::io::{self, AsyncReadExt};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 mod db;
 use db::Database;
@@ -15,19 +14,6 @@ use config::Config;
 mod embeddings;
 mod file;
 mod logging;
-
-#[derive(Debug)]
-struct FileEvent {
-    kind: FileEventKind,
-    file: file::File,
-}
-
-#[derive(Debug)]
-enum FileEventKind {
-    NewFile,
-    Delete,
-    Modify,
-}
 
 fn get_file_type(path_str: &str) -> io::Result<String> {
     let kind = infer::get_from_path(path_str)?;
@@ -110,14 +96,12 @@ async fn queue_remove_event(
             // Queue the delete event for later processing
             db.queue_file_event(path_str, db::FileEventType::Delete)?;
             info!("Queued delete event for {}", path_str);
-            return Ok(());
         } else {
             error!("Invalid UTF-8 path in remove event");
             return Err("Invalid UTF-8 path in remove event".into());
         }
     }
-    warn!("No valid path found in Remove event");
-    Err("No valid path found in Remove event".into())
+    Ok(())
 }
 
 async fn handle_event(
@@ -235,58 +219,6 @@ fn setup_file_watcher()
     Ok(filewatcher_rx)
 }
 
-async fn process_file_events(
-    mut eventhandler_rx: mpsc::Receiver<FileEvent>,
-    embedder: embeddings::Embedder,
-) {
-    info!("Event handler task started");
-    loop {
-        let file_event = match eventhandler_rx.recv().await {
-            Some(event) => event,
-            None => {
-                info!("Event handler channel closed, exiting task.");
-                break;
-            }
-        };
-
-        match file_event.kind {
-            FileEventKind::NewFile | FileEventKind::Modify => {
-                let event_type = match file_event.kind {
-                    FileEventKind::NewFile => "new",
-                    FileEventKind::Modify => "modified",
-                    _ => unreachable!(),
-                };
-
-                info!(
-                    "Processing {} file event: {:?}",
-                    event_type, file_event.file.path
-                );
-                match file_event.file.read().await {
-                    Ok(file_dat) => {
-                        debug!("Read file content: {} characters", file_dat.len());
-                        info!("Generating embeddings for text ({} chars)", file_dat.len());
-                        debug!("Sending request to OpenAI embeddings API");
-                        match embedder.genereate_embeddings(&file_dat).await {
-                            Ok(embeddings) => {
-                                debug!("Parsing embeddings response");
-                                info!(
-                                    "Generated embeddings with dimension: {}",
-                                    embeddings.data[0].embedding.len()
-                                );
-                                debug!("Embedding response: {:?}", embeddings);
-                            }
-                            Err(e) => error!("Failed to generate embeddings: {}", e),
-                        }
-                    }
-                    Err(e) => error!("Failed to read file: {}", e),
-                }
-            }
-            FileEventKind::Delete => info!("File deleted: {}", file_event.file.path),
-        }
-    }
-}
-
-// Process a single queued event
 async fn process_queued_event(
     event: db::QueuedEvent,
     db: &Database,
@@ -462,7 +394,7 @@ async fn run_main_event_loop(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (db, embedder) = init_app().await?;
 
-    let mut filewatcher_rx = setup_file_watcher()?;
+    let filewatcher_rx = setup_file_watcher()?;
 
     // Configure the queue processing parameters
     let process_interval = std::time::Duration::from_secs(60); // Process queue every 5 seconds
