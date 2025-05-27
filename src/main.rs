@@ -296,7 +296,7 @@ async fn process_queued_event(
             let path_str = &event.path;
             // Delete file from database
             match db.delete_file(path_str) {
-                Ok(file) => info!("Deleted file record for {}", path_str),
+                Ok(_file) => info!("Deleted file record for {}", path_str),
                 Err(e) => {
                     error!("Failed to delete file record: {}", e);
                     // Still mark as processed even if there was an error
