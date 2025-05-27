@@ -1,7 +1,6 @@
 use tracing::{subscriber::set_global_default};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
-/// Initialize the global tracing subscriber with a custom format layer
 pub fn init() -> Result<(), Box<dyn std::error::Error>> {
     let fmt_layer = fmt::layer()
         .pretty()
