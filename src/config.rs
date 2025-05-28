@@ -22,7 +22,7 @@ impl Config {
 
         if !bako_config_dir.exists() {
             info!("Creating config directory: {}", bako_config_dir.display());
-            std::fs::create_dir_all(&bako_config_dir)?; // Use create_dir_all for parent dirs
+            std::fs::create_dir_all(&bako_config_dir)?;
         }
 
         let config_path: std::path::PathBuf = bako_config_dir.join("config.toml");
