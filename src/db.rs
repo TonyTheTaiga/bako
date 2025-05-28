@@ -136,6 +136,14 @@ impl Database {
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS embeddings (
+                id TEXT PRIMARY KEY,
+                file_id TEXT NOT NULL,
+                embedding TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+            );
             "#,
         )?;
 
@@ -217,14 +225,6 @@ impl Database {
         Ok(jobs)
     }
 
-    pub fn update_job(&self, job_id: &str, status: &str, error_message: Option<&str>) -> rusqlite::Result<()> {
-        self.conn.execute(
-            "UPDATE jobs SET status = ?1, error_message = ?2 WHERE id = ?3",
-            params![status, error_message, job_id],
-        )?;
-        Ok(())
-    }
-
     pub fn update_job_batch(&mut self, job_ids: Vec<String>, status: &str, error_message: Option<&str>) -> rusqlite::Result<()> {
         let tx = self.conn.transaction()?;
         for job_id in job_ids {
@@ -244,5 +244,14 @@ impl Database {
                 })?;
 
         Ok(count as usize)
+    }
+
+    pub fn insert_embedding(&self, file_id: &str, embedding: &str) -> rusqlite::Result<()> {
+        let id = Uuid::new_v4().to_string();
+        self.conn.execute(
+            "INSERT INTO embeddings (id, file_id, embedding) VALUES (?1, ?2, ?3)",
+            params![&id, file_id, embedding],
+        )?;
+        Ok(())
     }
 }

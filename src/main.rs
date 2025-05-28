@@ -1,5 +1,6 @@
 use blake3::Hasher;
 use directories::BaseDirs;
+use serde_json;
 use std::path::Path;
 use tokio::fs;
 use tokio::io::{self, AsyncReadExt};
@@ -194,12 +195,16 @@ async fn process_event_queue(
 
     let jobs = db.get_jobs("pending")?;
     let mut completed_jobs: Vec<db::Job> = vec![];
-    let mut failed_jobs: Vec<db::Job> = vec![];
+    // let mut failed_jobs: Vec<db::Job> = vec![];
     for job in jobs {
         info!("Processing job: {}", job.id);
         let file = db.get_file(&job.file_id)?;
         let content = fs::read_to_string(&file.path).await?;
-        // let _embeddings = embedder.genereate_embeddings(&content).await?;
+        let embeddings_response = embedder.genereate_embeddings(&content).await?;
+        let embedding_vector = &embeddings_response.data[0].embedding;
+        let embedding_json = serde_json::to_string(embedding_vector)
+            .map_err(|e| format!("Failed to serialize embedding to JSON: {}", e))?;
+        db.insert_embedding(&job.file_id, &embedding_json)?;
         completed_jobs.push(job);
     }
 
@@ -211,13 +216,13 @@ async fn process_event_queue(
         )?;
     }
 
-    if !failed_jobs.is_empty() {
-        db.update_job_batch(
-            failed_jobs.iter().map(|job| job.id.clone()).collect(),
-            "failed",
-            Some("Failed to generate embeddings"),
-        )?;
-    }
+    // if !failed_jobs.is_empty() {
+    //     db.update_job_batch(
+    //         failed_jobs.iter().map(|job| job.id.clone()).collect(),
+    //         "failed",
+    //         Some("Failed to generate embeddings"),
+    //     )?;
+    // }
 
     Ok(())
 }
