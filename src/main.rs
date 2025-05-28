@@ -1,47 +1,22 @@
-use blake3::Hasher;
-use directories::BaseDirs;
 use serde_json;
 use std::path::Path;
 use tokio::fs;
-use tokio::io::{self, AsyncReadExt};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 mod db;
 use db::Database;
+use db::job_repo::Job;
 mod config;
-use config::Config;
 mod embeddings;
 mod file;
 mod logging;
 mod watcher;
-
-fn get_file_type(path_str: &str) -> io::Result<String> {
-    let kind = infer::get_from_path(path_str)?;
-    Ok(kind
-        .map(|k| k.mime_type().to_string())
-        .unwrap_or_else(|| "text/plain".into()))
-}
-
-async fn hash_file(path: &str) -> io::Result<String> {
-    let mut file = fs::File::open(path).await?;
-    let mut hasher = Hasher::new();
-    let mut buf = [0u8; 8192];
-
-    loop {
-        let n = file.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-
-    Ok(hasher.finalize().to_hex().to_string())
-}
+mod utils;
 
 async fn handle_file_event(
     event: db::FileEvent,
-    db: &Database,
+    db: &Database, // db is &Database, no change needed here for handle_file_event signature
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!(
         "File event received: {} for {}",
@@ -76,17 +51,17 @@ async fn process_create_event(
     event: &db::FileEvent,
     db: &Database,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let file_type = get_file_type(&event.path)?;
-    let hash = hash_file(&event.path).await?;
+    let file_type = utils::get_file_type(&event.path)?;
+    let hash = utils::hash_file(&event.path).await?;
     let size = std::fs::metadata(&event.path)?.len() as i64;
 
-    match db.upsert_file(&event.path, &file_type, &hash, size) {
+    match db.files().upsert_file(&event.path, &file_type, &hash, size) {
         Ok(file) => {
             info!(
                 "Successfully inserted file: {} (ID: {})",
                 file.path, file.id
             );
-            db.insert_job(&file.id)?;
+            db.jobs().insert_job(&file.id)?;
         }
         Err(e) => {
             error!("Failed to insert file {}: {}", event.path, e);
@@ -101,7 +76,7 @@ async fn process_delete_event(
     event: &db::FileEvent,
     db: &Database,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    db.delete_file(&event.path)?;
+    db.files().delete_file(&event.path)?;
     Ok(())
 }
 
@@ -109,59 +84,22 @@ async fn process_modify_event(
     event: &db::FileEvent,
     db: &Database,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let file_type = get_file_type(&event.path)?;
-    let hash = hash_file(&event.path).await?;
+    let file_type = utils::get_file_type(&event.path)?;
+    let hash = utils::hash_file(&event.path).await?;
     let size = std::fs::metadata(&event.path)?.len() as i64;
-    let file = db.upsert_file(&event.path, &file_type, &hash, size)?;
-    if db.get_jobs_by_file_id(&file.id, "pending").map_or(true, |jobs| jobs.is_empty()) {
-        db.insert_job(&file.id)?;
+    let file = db.files().upsert_file(&event.path, &file_type, &hash, size)?;
+    if db.jobs().get_jobs_by_file_id(&file.id, "pending").map_or(true, |jobs| jobs.is_empty()) {
+        db.jobs().insert_job(&file.id)?;
     }
     Ok(())
 }
 
-async fn init_config_dir() -> Result<Config, Box<dyn std::error::Error>> {
-    let base_dirs = BaseDirs::new().expect("Couldn't find the base directory");
-    let bako_config_dir = base_dirs.config_dir().join("io.tonythetaiga.bako");
-
-    if !bako_config_dir.exists() {
-        info!("Creating config directory: {}", bako_config_dir.display());
-        std::fs::create_dir(bako_config_dir.clone())?;
-    }
-
-    let config_path = bako_config_dir.join("config.toml");
-    if config_path.exists() {
-        info!("Reading existing config from {}", config_path.display());
-        let data = fs::read_to_string(&config_path).await.map_err(|e| {
-            error!("Failed to read config file: {}", e);
-            format!("Failed to read config toml! {}", e)
-        })?;
-
-        let cfg: Config = toml::from_str(&data).map_err(|e| {
-            error!("Failed to parse config file: {}", e);
-            format!("Failed to parse config toml! {}", e)
-        })?;
-
-        debug!("Config loaded successfully");
-        Ok(cfg)
-    } else {
-        info!("Creating new default config at {}", config_path.display());
-        let cfg = Config::new();
-        let data = toml::to_string_pretty(&cfg).map_err(|e| {
-            error!("Failed to serialize config: {}", e);
-            format!("Failed to format toml! {}", e)
-        })?;
-        fs::write(&config_path, data).await?;
-
-        info!("Default config created successfully");
-        Ok(cfg)
-    }
-}
-
-async fn init_app() -> Result<(Database, embeddings::Embedder), Box<dyn std::error::Error>> {
+async fn init_app() -> Result<(Database, embeddings::Embedder, config::Config), Box<dyn std::error::Error>> {
     logging::init()?;
-    let _config = init_config_dir().await?;
+    let config = config::Config::load_or_init().await?;
+    info!("Configuration loaded: {:?}", config);
 
-    let db_path = Path::new("bako.db");
+    let db_path = Path::new(&config.db_path);
     info!("Initializing database at {}", db_path.display());
     let db = Database::new(db_path)?;
 
@@ -179,57 +117,49 @@ async fn init_app() -> Result<(Database, embeddings::Embedder), Box<dyn std::err
             return Err(e);
         }
     };
-    Ok((db, embedder))
+    Ok((db, embedder, config))
 }
 
 async fn process_event_queue(
-    db: &mut Database,
+    db: &Database,
     embedder: &embeddings::Embedder,
     batch_size: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let queue_size = db.get_queue_size()?;
+    let queue_size = db.jobs().get_queue_size()?;
     info!(
         "Processing event queue (queue size: {}, batch size: {})",
         queue_size, batch_size
     );
 
-    let jobs = db.get_jobs("pending")?;
-    let mut completed_jobs: Vec<db::Job> = vec![];
-    // let mut failed_jobs: Vec<db::Job> = vec![];
+    let jobs = db.jobs().get_jobs("pending")?;
+    let mut completed_jobs: Vec<Job> = vec![];
+    // let mut failed_jobs: Vec<Job> = vec![];
     for job in jobs {
         info!("Processing job: {}", job.id);
-        let file = db.get_file(&job.file_id)?;
+        let file = db.files().get_file(&job.file_id)?;
         let content = fs::read_to_string(&file.path).await?;
         let embeddings_response = embedder.genereate_embeddings(&content).await?;
         let embedding_vector = &embeddings_response.data[0].embedding;
         let embedding_json = serde_json::to_string(embedding_vector)
             .map_err(|e| format!("Failed to serialize embedding to JSON: {}", e))?;
-        db.insert_embedding(&job.file_id, &embedding_json)?;
+        db.embeddings().insert_embedding(&job.file_id, &embedding_json)?;
         completed_jobs.push(job);
     }
 
     if !completed_jobs.is_empty() {
-        db.update_job_batch(
+        db.jobs().update_job_batch(
             completed_jobs.iter().map(|job| job.id.clone()).collect(),
             "completed",
             None,
         )?;
     }
 
-    // if !failed_jobs.is_empty() {
-    //     db.update_job_batch(
-    //         failed_jobs.iter().map(|job| job.id.clone()).collect(),
-    //         "failed",
-    //         Some("Failed to generate embeddings"),
-    //     )?;
-    // }
-
     Ok(())
 }
 
 async fn run_main_event_loop(
     mut fs_event_receiver: mpsc::Receiver<db::FileEvent>,
-    db: &mut Database,
+    db: &Database,
     embedder: &embeddings::Embedder,
     process_interval: std::time::Duration,
     batch_size: usize,
@@ -246,7 +176,7 @@ async fn run_main_event_loop(
             }
 
             _ = interval.tick() => {
-                if let Err(e) = process_event_queue(&mut *db, embedder, batch_size).await {
+                if let Err(e) = process_event_queue(db, embedder, batch_size).await {
                     error!("Error processing event queue: {}", e);
                 }
             }
@@ -263,11 +193,11 @@ async fn run_main_event_loop(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (mut db, embedder) = init_app().await?;
-    let target_dir = Path::new("/Users/taigaishida/workspace/bako/data");
-    let fs_event_receiver = watcher::setup_file_watcher(target_dir, 3)?;
-    let process_interval = std::time::Duration::from_secs(28);
-    let batch_size = 10;
+    let (db, embedder, config) = init_app().await?;
+    let target_dir = Path::new(&config.watch_directory);
+    let fs_event_receiver = watcher::setup_file_watcher(target_dir, config.watcher_poll_duration_secs)?;
+    let process_interval = std::time::Duration::from_secs(config.queue_process_interval_secs);
+    let batch_size = config.queue_batch_size;
 
     info!(
         "Starting queue-based event processing (interval: {:?}, batch size: {})",
@@ -276,7 +206,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     run_main_event_loop(
         fs_event_receiver,
-        &mut db,
+        &db, 
         &embedder,
         process_interval,
         batch_size,

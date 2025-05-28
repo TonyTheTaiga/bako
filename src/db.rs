@@ -1,8 +1,10 @@
 use std::path::Path;
 
-use crate::file;
-use rusqlite::{Connection, params};
-use uuid::Uuid;
+use rusqlite::Connection;
+
+pub mod job_repo;
+pub mod file_repo;
+pub mod embedding_repo;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FileEventType {
@@ -39,15 +41,6 @@ pub struct FileEvent {
     pub event_type: FileEventType,
 }
 
-#[derive(Debug, Clone)]
-pub struct Job {
-    pub id: String,
-    pub file_id: String,
-    pub status: String,
-    pub error_message: Option<String>,
-    pub created_at: String,
-}
-
 impl FileEvent {
     pub fn from_notify_event(event: notify::Event) -> Vec<FileEvent> {
         let mut file_events = Vec::new();
@@ -78,29 +71,7 @@ impl FileEvent {
 }
 
 pub struct Database {
-    conn: Connection,
-}
-
-fn row_to_file(row: &rusqlite::Row) -> rusqlite::Result<file::File> {
-    Ok(file::File {
-        id: row.get(0)?,
-        path: row.get(1)?,
-        file_type: row.get(2)?,
-        hash: row.get(3)?,
-        size: row.get(4)?,
-        created_at: row.get(5)?,
-        updated_at: row.get(6)?,
-    })
-}
-
-fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<Job> {
-    Ok(Job {
-        id: row.get(0)?,
-        file_id: row.get(1)?,
-        status: row.get(2)?,
-        error_message: row.get(3)?,
-        created_at: row.get(4)?,
-    })
+    pub(crate) conn: Connection,
 }
 
 impl Database {
@@ -150,108 +121,15 @@ impl Database {
         Ok(Database { conn })
     }
 
-    pub fn upsert_file(
-        &self,
-        path: &str,
-        file_type: &str,
-        hash: &str,
-        size: i64,
-    ) -> rusqlite::Result<file::File> {
-        let id = Uuid::new_v4().to_string();
-        let file = self.conn.query_row(
-            r#"
-            INSERT INTO files (id, path, file_type, hash, size) 
-            VALUES (?1, ?2, ?3, ?4, ?5)
-            ON CONFLICT(path) DO UPDATE SET
-                file_type = excluded.file_type,
-                hash = excluded.hash,
-                size = excluded.size,
-                updated_at = CURRENT_TIMESTAMP
-            RETURNING id, path, file_type, hash, size, created_at, updated_at
-            "#,
-            params![&id, path, file_type, hash, size],
-            row_to_file,
-        )?;
-        Ok(file)
+    pub fn jobs(&self) -> job_repo::JobRepository {
+        job_repo::JobRepository::new(self)
     }
 
-    pub fn get_file(&self, id: &str) -> rusqlite::Result<file::File> {
-        let file =
-            self.conn
-                .query_row("SELECT * FROM files WHERE id = ($1)", [id], row_to_file)?;
-        Ok(file)
+    pub fn files(&self) -> file_repo::FileRepository {
+        file_repo::FileRepository::new(self)
     }
 
-    pub fn delete_file(&self, path: &str) -> rusqlite::Result<file::File> {
-        let file = self.conn.query_row(
-            "DELETE FROM files WHERE path = ?1 RETURNING id, path, file_type, hash, size, created_at, updated_at",
-            [path],
-            row_to_file,
-        )?;
-        Ok(file)
-    }
-
-    pub fn insert_job(&self, file_id: &str) -> rusqlite::Result<String> {
-        let id = Uuid::new_v4().to_string();
-        self.conn.execute(
-            "INSERT INTO jobs (id, file_id, status, error_message) VALUES (?1, ?2, ?3, ?4)",
-            params![&id, file_id, "pending", None::<String>],
-        )?;
-        Ok(id)
-    }
-
-    pub fn get_jobs_by_file_id(&self, file_id: &str, status: &str) -> rusqlite::Result<Vec<Job>> {
-        let base_query = "SELECT id, file_id, status, error_message, created_at FROM jobs WHERE file_id = ?1";
-        let jobs = if status.eq_ignore_ascii_case("any") {
-            let mut stmt = self.conn.prepare(base_query)?;
-            stmt.query_map(params![file_id], row_to_job)?
-                .collect::<Result<Vec<_>, _>>()?
-        } else {
-            let full_query = format!("{} AND status = ?2", base_query);
-            let mut stmt = self.conn.prepare(&full_query)?;
-            stmt.query_map(params![file_id, status], row_to_job)?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        Ok(jobs)
-    }
-
-    pub fn get_jobs(&self, status: &str) -> rusqlite::Result<Vec<Job>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, file_id, status, error_message, created_at FROM jobs WHERE status = ?1",
-        )?;
-        let jobs = stmt
-            .query_map([status], row_to_job)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(jobs)
-    }
-
-    pub fn update_job_batch(&mut self, job_ids: Vec<String>, status: &str, error_message: Option<&str>) -> rusqlite::Result<()> {
-        let tx = self.conn.transaction()?;
-        for job_id in job_ids {
-            tx.execute(
-                "UPDATE jobs SET status = ?1, error_message = ?2 WHERE id = ?3",
-                params![status, error_message, job_id],
-            )?;
-        }
-        tx.commit()
-    }
-
-    pub fn get_queue_size(&self) -> rusqlite::Result<usize> {
-        let count: i64 =
-            self.conn
-                .query_row("SELECT COUNT(*) FROM jobs WHERE status = 'pending'", [], |row| {
-                    row.get(0)
-                })?;
-
-        Ok(count as usize)
-    }
-
-    pub fn insert_embedding(&self, file_id: &str, embedding: &str) -> rusqlite::Result<()> {
-        let id = Uuid::new_v4().to_string();
-        self.conn.execute(
-            "INSERT INTO embeddings (id, file_id, embedding) VALUES (?1, ?2, ?3)",
-            params![&id, file_id, embedding],
-        )?;
-        Ok(())
+    pub fn embeddings(&self) -> embedding_repo::EmbeddingRepository {
+        embedding_repo::EmbeddingRepository::new(self)
     }
 }
