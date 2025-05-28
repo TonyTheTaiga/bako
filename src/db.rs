@@ -2,8 +2,6 @@ use std::path::Path;
 
 use crate::file;
 use rusqlite::{Connection, params};
-use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{debug, warn};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -89,8 +87,9 @@ fn row_to_file(row: &rusqlite::Row) -> rusqlite::Result<file::File> {
         path: row.get(1)?,
         file_type: row.get(2)?,
         hash: row.get(3)?,
-        created_at: row.get(4)?,
-        updated_at: row.get(5)?,
+        size: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
     })
 }
 
@@ -115,6 +114,7 @@ impl Database {
                 path TEXT NOT NULL UNIQUE,
                 file_type TEXT NOT NULL,
                 hash TEXT NOT NULL,
+                size INTEGER NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
@@ -142,39 +142,41 @@ impl Database {
         Ok(Database { conn })
     }
 
-    pub fn insert_file(
+    pub fn upsert_file(
         &self,
         path: &str,
         file_type: &str,
         hash: &str,
+        size: i64,
     ) -> rusqlite::Result<file::File> {
         let id = Uuid::new_v4().to_string();
         let file = self.conn.query_row(
             r#"
-            INSERT INTO files (id, path, file_type, hash) 
-            VALUES (?1, ?2, ?3, ?4)
+            INSERT INTO files (id, path, file_type, hash, size) 
+            VALUES (?1, ?2, ?3, ?4, ?5)
             ON CONFLICT(path) DO UPDATE SET
                 file_type = excluded.file_type,
                 hash = excluded.hash,
+                size = excluded.size,
                 updated_at = CURRENT_TIMESTAMP
-            RETURNING id, path, file_type, hash, created_at, updated_at
+            RETURNING id, path, file_type, hash, size, created_at, updated_at
             "#,
-            [&id, path, file_type, hash],
+            params![&id, path, file_type, hash, size],
             row_to_file,
         )?;
         Ok(file)
     }
 
-    pub fn get_file(&self, path: &str) -> rusqlite::Result<file::File> {
+    pub fn get_file(&self, id: &str) -> rusqlite::Result<file::File> {
         let file =
             self.conn
-                .query_row("SELECT * FROM files WHERE path = ($1)", [path], row_to_file)?;
+                .query_row("SELECT * FROM files WHERE id = ($1)", [id], row_to_file)?;
         Ok(file)
     }
 
     pub fn delete_file(&self, path: &str) -> rusqlite::Result<file::File> {
         let file = self.conn.query_row(
-            "DELETE FROM files WHERE path = ?1 RETURNING id, path, file_type, hash, created_at, updated_at",
+            "DELETE FROM files WHERE path = ?1 RETURNING id, path, file_type, hash, size, created_at, updated_at",
             [path],
             row_to_file,
         )?;
@@ -190,6 +192,21 @@ impl Database {
         Ok(id)
     }
 
+    pub fn get_jobs_by_file_id(&self, file_id: &str, status: &str) -> rusqlite::Result<Vec<Job>> {
+        let base_query = "SELECT id, file_id, status, error_message, created_at FROM jobs WHERE file_id = ?1";
+        let jobs = if status.eq_ignore_ascii_case("any") {
+            let mut stmt = self.conn.prepare(base_query)?;
+            stmt.query_map(params![file_id], row_to_job)?
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            let full_query = format!("{} AND status = ?2", base_query);
+            let mut stmt = self.conn.prepare(&full_query)?;
+            stmt.query_map(params![file_id, status], row_to_job)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        Ok(jobs)
+    }
+
     pub fn get_jobs(&self, status: &str) -> rusqlite::Result<Vec<Job>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, file_id, status, error_message, created_at FROM jobs WHERE status = ?1",
@@ -198,6 +215,25 @@ impl Database {
             .query_map([status], row_to_job)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(jobs)
+    }
+
+    pub fn update_job(&self, job_id: &str, status: &str, error_message: Option<&str>) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE jobs SET status = ?1, error_message = ?2 WHERE id = ?3",
+            params![status, error_message, job_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_job_batch(&mut self, job_ids: Vec<String>, status: &str, error_message: Option<&str>) -> rusqlite::Result<()> {
+        let tx = self.conn.transaction()?;
+        for job_id in job_ids {
+            tx.execute(
+                "UPDATE jobs SET status = ?1, error_message = ?2 WHERE id = ?3",
+                params![status, error_message, job_id],
+            )?;
+        }
+        tx.commit()
     }
 
     pub fn get_queue_size(&self) -> rusqlite::Result<usize> {

@@ -57,6 +57,10 @@ async fn handle_file_event(
         }
         db::FileEventType::Modify => {
             info!("Processing modify event for: {}", event.path);
+            if let Err(e) = process_modify_event(&event, db).await {
+                error!("Failed to process modify event for {}: {}", event.path, e);
+                return Err(e);
+            }
         }
         db::FileEventType::Delete => {
             info!("Processing delete event for: {}", event.path);
@@ -76,14 +80,14 @@ async fn process_create_event(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let file_type = get_file_type(&event.path)?;
     let hash = hash_file(&event.path).await?;
+    let size = std::fs::metadata(&event.path)?.len() as i64;
 
-    match db.insert_file(&event.path, &file_type, &hash) {
+    match db.upsert_file(&event.path, &file_type, &hash, size) {
         Ok(file) => {
             info!(
                 "Successfully inserted file: {} (ID: {})",
                 file.path, file.id
             );
-
             db.insert_job(&file.id)?;
         }
         Err(e) => {
@@ -99,8 +103,21 @@ async fn process_delete_event(
     event: &db::FileEvent,
     db: &Database,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let file = db.get_file(&event.path)?;
-    db.delete_file(&file.path)?;
+    db.delete_file(&event.path)?;
+    Ok(())
+}
+
+async fn process_modify_event(
+    event: &db::FileEvent,
+    db: &Database,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file_type = get_file_type(&event.path)?;
+    let hash = hash_file(&event.path).await?;
+    let size = std::fs::metadata(&event.path)?.len() as i64;
+    let file = db.upsert_file(&event.path, &file_type, &hash, size)?;
+    if db.get_jobs_by_file_id(&file.id, "pending").map_or(true, |jobs| jobs.is_empty()) {
+        db.insert_job(&file.id)?;
+    }
     Ok(())
 }
 
@@ -168,7 +185,7 @@ async fn init_app() -> Result<(Database, embeddings::Embedder), Box<dyn std::err
 }
 
 async fn process_event_queue(
-    db: &Database,
+    db: &mut Database,
     embedder: &embeddings::Embedder,
     batch_size: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -177,12 +194,40 @@ async fn process_event_queue(
         "Processing event queue (queue size: {}, batch size: {})",
         queue_size, batch_size
     );
+
+    let jobs = db.get_jobs("pending")?;
+    let mut completed_jobs: Vec<db::Job> = vec![];
+    let mut failed_jobs: Vec<db::Job> = vec![];
+    for job in jobs {
+        info!("Processing job: {}", job.id);
+        let file = db.get_file(&job.file_id)?;
+        let content = fs::read_to_string(&file.path).await?;
+        // let _embeddings = embedder.genereate_embeddings(&content).await?;
+        completed_jobs.push(job);
+    }
+
+    if !completed_jobs.is_empty() {
+        db.update_job_batch(
+            completed_jobs.iter().map(|job| job.id.clone()).collect(),
+            "completed",
+            None,
+        )?;
+    }
+
+    if !failed_jobs.is_empty() {
+        db.update_job_batch(
+            failed_jobs.iter().map(|job| job.id.clone()).collect(),
+            "failed",
+            Some("Failed to generate embeddings"),
+        )?;
+    }
+
     Ok(())
 }
 
 async fn run_main_event_loop(
     mut fs_event_receiver: mpsc::Receiver<db::FileEvent>,
-    db: &Database,
+    db: &mut Database,
     embedder: &embeddings::Embedder,
     process_interval: std::time::Duration,
     batch_size: usize,
@@ -199,7 +244,7 @@ async fn run_main_event_loop(
             }
 
             _ = interval.tick() => {
-                if let Err(e) = process_event_queue(db, embedder, batch_size).await {
+                if let Err(e) = process_event_queue(&mut *db, embedder, batch_size).await {
                     error!("Error processing event queue: {}", e);
                 }
             }
@@ -216,7 +261,7 @@ async fn run_main_event_loop(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (db, embedder) = init_app().await?;
+    let (mut db, embedder) = init_app().await?;
     let target_dir = Path::new("/Users/taigaishida/workspace/bako/data");
     let fs_event_receiver = watcher::setup_file_watcher(target_dir, 5)?;
     let process_interval = std::time::Duration::from_secs(5);
@@ -229,7 +274,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     run_main_event_loop(
         fs_event_receiver,
-        &db,
+        &mut db,
         &embedder,
         process_interval,
         batch_size,

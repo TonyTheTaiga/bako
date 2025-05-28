@@ -6,6 +6,7 @@ pub struct File {
     pub path: String,
     pub file_type: String,
     pub hash: String,
+    pub size: i64,
     pub created_at: String,
     pub updated_at: String,
 }
