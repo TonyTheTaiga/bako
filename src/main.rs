@@ -16,7 +16,7 @@ mod utils;
 
 async fn handle_file_event(
     event: db::FileEvent,
-    db: &Database, // db is &Database, no change needed here for handle_file_event signature
+    db: &Database,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!(
         "File event received: {} for {}",
@@ -133,7 +133,6 @@ async fn process_event_queue(
 
     let jobs = db.jobs().get_jobs("pending")?;
     let mut completed_jobs: Vec<Job> = vec![];
-    // let mut failed_jobs: Vec<Job> = vec![];
     for job in jobs {
         info!("Processing job: {}", job.id);
         let file = db.files().get_file(&job.file_id)?;

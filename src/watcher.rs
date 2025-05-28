@@ -20,7 +20,6 @@ pub fn setup_file_watcher(
             let mut watcher = PollWatcher::new(
                 move |res: notify::Result<notify::Event>| match res {
                     Ok(event) => {
-                        // from notify event only returns event corresponding to a file
                         let file_events = db::FileEvent::from_notify_event(event);
                         for file_event in file_events {
                             if let Err(e) = sender.blocking_send(file_event) {

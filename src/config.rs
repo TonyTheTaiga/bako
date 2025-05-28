@@ -10,9 +10,6 @@ pub struct Config {
     pub watcher_poll_duration_secs: u64,
     pub queue_process_interval_secs: u64,
     pub queue_batch_size: usize,
-    // Potentially add OpenAI model and dimensions here if they need to be configurable
-    // pub openai_model: String,
-    // pub openai_dimensions: usize,
 }
 
 impl Config {
@@ -42,7 +39,7 @@ impl Config {
             debug!("Config loaded successfully: {:?}", cfg);
             Ok(cfg)
         } else {
-            Err("Config file does not exist. Creating default config.".into())
+            Err("Config file does not exist.".into())
         }
     }
 }
