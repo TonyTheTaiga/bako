@@ -49,21 +49,18 @@ async fn handle_file_event(
 
     match event.event_type {
         db::FileEventType::Create => {
-            info!("Processing create event for: {}", event.path);
             if let Err(e) = process_create_event(&event, db).await {
                 error!("Failed to process create event for {}: {}", event.path, e);
                 return Err(e);
             }
         }
         db::FileEventType::Modify => {
-            info!("Processing modify event for: {}", event.path);
             if let Err(e) = process_modify_event(&event, db).await {
                 error!("Failed to process modify event for {}: {}", event.path, e);
                 return Err(e);
             }
         }
         db::FileEventType::Delete => {
-            info!("Processing delete event for: {}", event.path);
             if let Err(e) = process_delete_event(&event, db).await {
                 error!("Failed to process delete event for {}: {}", event.path, e);
                 return Err(e);
@@ -263,8 +260,8 @@ async fn run_main_event_loop(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut db, embedder) = init_app().await?;
     let target_dir = Path::new("/Users/taigaishida/workspace/bako/data");
-    let fs_event_receiver = watcher::setup_file_watcher(target_dir, 5)?;
-    let process_interval = std::time::Duration::from_secs(5);
+    let fs_event_receiver = watcher::setup_file_watcher(target_dir, 3)?;
+    let process_interval = std::time::Duration::from_secs(28);
     let batch_size = 10;
 
     info!(
