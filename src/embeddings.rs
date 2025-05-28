@@ -11,7 +11,7 @@ pub struct EmbeddingResponse {
 #[derive(Debug, Deserialize)]
 pub struct EmbeddingData {
     pub object: String,
-    pub embedding: Vec<f32>, // 1536 floats for ada-002
+    pub embedding: Vec<f32>,
     pub index: usize,
 }
 

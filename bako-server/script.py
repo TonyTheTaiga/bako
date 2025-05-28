@@ -24,7 +24,6 @@ db.enable_load_extension(False)
 vec_version, = db.execute("select vec_version()").fetchone()
 print(f"vec_version={vec_version}")
 
-# build index
 db.execute("DROP TABLE IF EXISTS vec_items")
 db.execute("CREATE VIRTUAL TABLE vec_items USING vec0(embedding float[512] DISTANCE_METRIC=cosine, file_id text)")
 db.execute(
@@ -35,7 +34,7 @@ db.execute(
     """
     )
 
-query = "taiga ishida"
+query = "my name is taiga..."
 embedding = get_embedding(query)
 
 def serialize_f32(vector: List[float]) -> bytes:
