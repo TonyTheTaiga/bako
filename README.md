@@ -10,8 +10,9 @@ Bako aims to evolve beyond a single-instance application into a distributed know
 *   **Distributed Nodes**: Deploy Bako (Rust core) instances on multiple computers, devices, or servers. Each node will monitor local file changes, process data, and generate embeddings independently.
 *   **Central Knowledge Base**: Data (metadata, embeddings, and potentially processed content) from all distributed nodes will be synchronized and aggregated into a central knowledge base.
 *   **MCP Server**: The Bako Server (Python) (currently heavily under construction) will serve as the central MCP server. This server will provide a standardized interface for querying and interacting with the aggregated knowledge from all connected nodes.
+*   **Web Application Interface**: A web application will be developed to provide a user-friendly interface for managing the data, configuring knowledge bases, and interacting with the search and retrieval functionalities of the central MCP server.
 *   **Scalability and Collaboration**: This architecture will allow for a massively scalable knowledge base, enabling teams or individuals to collaboratively build and share knowledge across different locations and devices.
-*   **Unified Access**: Users will be able to access the entire distributed knowledge base through the central MCP server, regardless of where the data originated.
+*   **Unified Access**: Users will be able to access the entire distributed knowledge base through the central MCP server or the web application, regardless of where the data originated.
 
 This distributed model will empower users to create powerful, interconnected knowledge ecosystems.
 
