@@ -46,6 +46,61 @@ async fn handle_file_event(
         "File event received: {} for {}",
         event.event_type, event.path
     );
+
+    match event.event_type {
+        db::FileEventType::Create => {
+            info!("Processing create event for: {}", event.path);
+            if let Err(e) = process_create_event(&event, db).await {
+                error!("Failed to process create event for {}: {}", event.path, e);
+                return Err(e);
+            }
+        }
+        db::FileEventType::Modify => {
+            info!("Processing modify event for: {}", event.path);
+        }
+        db::FileEventType::Delete => {
+            info!("Processing delete event for: {}", event.path);
+            if let Err(e) = process_delete_event(&event, db).await {
+                error!("Failed to process delete event for {}: {}", event.path, e);
+                return Err(e);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn process_create_event(
+    event: &db::FileEvent,
+    db: &Database,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file_type = get_file_type(&event.path)?;
+    let hash = hash_file(&event.path).await?;
+
+    match db.insert_file(&event.path, &file_type, &hash) {
+        Ok(file) => {
+            info!(
+                "Successfully inserted file: {} (ID: {})",
+                file.path, file.id
+            );
+
+            db.insert_job(&file.id)?;
+        }
+        Err(e) => {
+            error!("Failed to insert file {}: {}", event.path, e);
+            return Err(Box::new(e));
+        }
+    }
+
+    Ok(())
+}
+
+async fn process_delete_event(
+    event: &db::FileEvent,
+    db: &Database,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file = db.get_file(&event.path)?;
+    db.delete_file(&file.path)?;
     Ok(())
 }
 
@@ -126,7 +181,7 @@ async fn process_event_queue(
 }
 
 async fn run_main_event_loop(
-    mut filewatcher_rx: mpsc::Receiver<db::FileEvent>,
+    mut fs_event_receiver: mpsc::Receiver<db::FileEvent>,
     db: &Database,
     embedder: &embeddings::Embedder,
     process_interval: std::time::Duration,
@@ -136,7 +191,7 @@ async fn run_main_event_loop(
     let mut interval = tokio::time::interval(process_interval);
     loop {
         tokio::select! {
-            Some(event) = filewatcher_rx.recv() => {
+            Some(event) = fs_event_receiver.recv() => {
                 debug!("Received file system event: {} for {}", event.event_type, event.path);
                 if let Err(e) = handle_file_event(event, db).await {
                     error!("Error handling event: {:?}", e);
@@ -162,7 +217,8 @@ async fn run_main_event_loop(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (db, embedder) = init_app().await?;
-    let filewatcher_rx = watcher::setup_file_watcher()?;
+    let target_dir = Path::new("/Users/taigaishida/workspace/bako/data");
+    let fs_event_receiver = watcher::setup_file_watcher(target_dir, 5)?;
     let process_interval = std::time::Duration::from_secs(5);
     let batch_size = 10;
 
@@ -171,7 +227,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         process_interval, batch_size
     );
 
-    run_main_event_loop(filewatcher_rx, &db, &embedder, process_interval, batch_size).await?;
+    run_main_event_loop(
+        fs_event_receiver,
+        &db,
+        &embedder,
+        process_interval,
+        batch_size,
+    )
+    .await?;
 
     info!("Exiting application");
 

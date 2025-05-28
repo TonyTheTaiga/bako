@@ -35,18 +35,19 @@ impl FileEventType {
     }
 }
 
-pub struct QueuedEvent {
-    pub id: String,
-    pub path: String,
-    pub event_type: FileEventType,
-    pub created_at: i64,
-    pub processed: bool,
-}
-
 #[derive(Debug, Clone)]
 pub struct FileEvent {
     pub path: String,
     pub event_type: FileEventType,
+}
+
+#[derive(Debug, Clone)]
+pub struct Job {
+    pub id: String,
+    pub file_id: String,
+    pub status: String,
+    pub error_message: Option<String>,
+    pub created_at: String,
 }
 
 impl FileEvent {
@@ -64,7 +65,7 @@ impl FileEvent {
         if let Some(event_type) = event_type {
             for path in event.paths {
                 if let Some(path_str) = path.to_str() {
-                    if path.is_file() {
+                    if path.is_file() || event_type == FileEventType::Delete {
                         file_events.push(FileEvent {
                             path: path_str.to_string(),
                             event_type,
@@ -82,9 +83,31 @@ pub struct Database {
     conn: Connection,
 }
 
+fn row_to_file(row: &rusqlite::Row) -> rusqlite::Result<file::File> {
+    Ok(file::File {
+        id: row.get(0)?,
+        path: row.get(1)?,
+        file_type: row.get(2)?,
+        hash: row.get(3)?,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
+
+fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<Job> {
+    Ok(Job {
+        id: row.get(0)?,
+        file_id: row.get(1)?,
+        status: row.get(2)?,
+        error_message: row.get(3)?,
+        created_at: row.get(4)?,
+    })
+}
+
 impl Database {
     pub fn new(path_str: &Path) -> rusqlite::Result<Database> {
         let conn = Connection::open(path_str)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS files (
@@ -105,176 +128,85 @@ impl Database {
                 WHERE id = OLD.id;
             END;
             
-            CREATE TABLE IF NOT EXISTS file_events (
+            CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY,
-                path TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                processed BOOLEAN NOT NULL DEFAULT 0
+                file_id TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('pending', 'running', 'completed', 'failed')),
+                error_message TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
             );
-            
-            CREATE INDEX IF NOT EXISTS idx_file_events_processed 
-            ON file_events(processed, created_at);
-            
-            CREATE INDEX IF NOT EXISTS idx_file_events_path 
-            ON file_events(path, created_at);
             "#,
         )?;
 
         Ok(Database { conn })
     }
 
-    pub fn delete_file(&self, path: &str) -> rusqlite::Result<file::File> {
+    pub fn insert_file(
+        &self,
+        path: &str,
+        file_type: &str,
+        hash: &str,
+    ) -> rusqlite::Result<file::File> {
+        let id = Uuid::new_v4().to_string();
         let file = self.conn.query_row(
-            "DELETE FROM files WHERE path = ?1 RETURNING id, path, file_type, hash, created_at, updated_at",
-            [path],
-            |row| {
-                Ok(file::File {
-                    id: row.get(0)?,
-                    path: row.get(1)?,
-                    file_type: row.get(2)?,
-                    hash: row.get(3)?,
-                    created_at: row.get(4)?,
-                    updated_at: row.get(5)?,
-                })
-            },
+            r#"
+            INSERT INTO files (id, path, file_type, hash) 
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(path) DO UPDATE SET
+                file_type = excluded.file_type,
+                hash = excluded.hash,
+                updated_at = CURRENT_TIMESTAMP
+            RETURNING id, path, file_type, hash, created_at, updated_at
+            "#,
+            [&id, path, file_type, hash],
+            row_to_file,
         )?;
         Ok(file)
     }
 
-    pub fn queue_file_event(&self, path: &str, event_type: FileEventType) -> rusqlite::Result<()> {
-        let id = Uuid::new_v4().to_string();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-
-        self.conn.execute(
-            "INSERT INTO file_events (id, path, event_type, created_at, processed) VALUES (?, ?, ?, ?, 0)",
-            params![id, path, event_type.to_string(), now],
-        )?;
-
-        Ok(())
+    pub fn get_file(&self, path: &str) -> rusqlite::Result<file::File> {
+        let file =
+            self.conn
+                .query_row("SELECT * FROM files WHERE path = ($1)", [path], row_to_file)?;
+        Ok(file)
     }
 
-    pub fn get_pending_events(&self, limit: usize) -> rusqlite::Result<Vec<QueuedEvent>> {
-        let mut stmt = self.conn.prepare(
-            "
-            WITH ranked_events AS (
-                SELECT
-                    id,
-                    path,
-                    event_type,
-                    created_at,
-                    processed,
-                    ROW_NUMBER() OVER (PARTITION BY path ORDER BY created_at DESC, id DESC) as rn
-                FROM file_events
-                WHERE processed = 0
-            )
-            SELECT id, path, event_type, created_at, processed
-            FROM ranked_events
-            WHERE rn = 1
-            ORDER BY created_at ASC
-            LIMIT ?
-        ",
+    pub fn delete_file(&self, path: &str) -> rusqlite::Result<file::File> {
+        let file = self.conn.query_row(
+            "DELETE FROM files WHERE path = ?1 RETURNING id, path, file_type, hash, created_at, updated_at",
+            [path],
+            row_to_file,
         )?;
+        Ok(file)
+    }
 
-        let events = stmt
-            .query_map([limit as i64], |row| {
-                Ok(QueuedEvent {
-                    id: row.get(0)?,
-                    path: row.get(1)?,
-                    event_type: FileEventType::from_string(&row.get::<_, String>(2)?)
-                        .unwrap_or(FileEventType::Create),
-                    created_at: row.get(3)?,
-                    processed: row.get(4)?,
-                })
-            })?
+    pub fn insert_job(&self, file_id: &str) -> rusqlite::Result<String> {
+        let id = Uuid::new_v4().to_string();
+        self.conn.execute(
+            "INSERT INTO jobs (id, file_id, status, error_message) VALUES (?1, ?2, ?3, ?4)",
+            params![&id, file_id, "pending", None::<String>],
+        )?;
+        Ok(id)
+    }
+
+    pub fn get_jobs(&self, status: &str) -> rusqlite::Result<Vec<Job>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, file_id, status, error_message, created_at FROM jobs WHERE status = ?1",
+        )?;
+        let jobs = stmt
+            .query_map([status], row_to_job)?
             .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(events)
+        Ok(jobs)
     }
 
     pub fn get_queue_size(&self) -> rusqlite::Result<usize> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM file_events WHERE processed = 0",
-            [],
-            |row| row.get(0),
-        )?;
+        let count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM jobs WHERE status = 'pending'", [], |row| {
+                    row.get(0)
+                })?;
 
         Ok(count as usize)
-    }
-
-    pub fn batch_create_or_update_files(
-        &self,
-        operations: Vec<(String, String, String)>, // (path, file_type, hash)
-    ) -> rusqlite::Result<Vec<file::File>> {
-        let mut files = Vec::new();
-
-        let tx = self.conn.unchecked_transaction()?;
-
-        for (path_str, file_type, hash) in operations {
-            let id = Uuid::new_v4();
-            let file = tx.query_row(
-                r#"
-                INSERT INTO files (id, path, file_type, hash)
-                VALUES (?1, ?2, ?3, ?4)
-                ON CONFLICT(path) DO UPDATE SET
-                    file_type = excluded.file_type,
-                    hash = excluded.hash,
-                    updated_at = CURRENT_TIMESTAMP
-                RETURNING id, path, file_type, hash, created_at, updated_at;
-                "#,
-                [&id.to_string(), &path_str, &file_type, &hash],
-                |row| {
-                    Ok(file::File {
-                        id: row.get(0)?,
-                        path: row.get(1)?,
-                        file_type: row.get(2)?,
-                        hash: row.get(3)?,
-                        created_at: row.get(4)?,
-                        updated_at: row.get(5)?,
-                    })
-                },
-            )?;
-            files.push(file);
-        }
-
-        tx.commit()?;
-        Ok(files)
-    }
-
-    pub fn batch_mark_processed(
-        &self,
-        operations: Vec<(String, String, i64)>, // (event_id, path, created_at)
-    ) -> rusqlite::Result<usize> {
-        let tx = self.conn.unchecked_transaction()?;
-        let mut total_updated = 0;
-
-        for (event_id, path, created_at) in operations {
-            debug!(
-                "Marking event id {} (path: {}, created_at: {}) and older events for this path as processed.",
-                event_id, path, created_at
-            );
-
-            let rows_updated = tx.execute(
-                "UPDATE file_events
-                 SET processed = 1
-                 WHERE path = ?1 AND created_at <= ?2 AND processed = 0",
-                params![path, created_at],
-            )?;
-
-            if rows_updated == 0 {
-                warn!(
-                    "batch_mark_processed: No rows updated for path '{}' at/before timestamp {}. Event id {} was targeted.",
-                    path, created_at, event_id
-                );
-            }
-
-            total_updated += rows_updated;
-        }
-
-        tx.commit()?;
-        Ok(total_updated)
     }
 }
