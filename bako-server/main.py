@@ -9,6 +9,7 @@ from mcp.server.fastmcp import FastMCP
 from openai import OpenAI
 
 
+@lru_cache(maxsize=1)
 def get_db_connection():
     """Create and return a database connection."""
     conn = sqlite3.connect("/Users/taigaishida/workspace/bako/bako.db")
